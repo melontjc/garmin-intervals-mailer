@@ -323,7 +323,7 @@ async function buildAiCoachReport(env, analysis) {
       body: JSON.stringify({
         model: env.OPENAI_MODEL || "gpt-4.1-mini",
         max_output_tokens: 1600,
-        instructions: "你是一名严谨的自行车训练分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，结构清晰，给出具体但不过度医疗化的训练和恢复建议。",
+        instructions: "你是一名严谨但表达有活力的自行车训练分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，结构清晰，给出具体但不过度医疗化的训练和恢复建议。语气可以像私人教练，专业、轻快、有一点鼓励感。",
         input: [
           {
             role: "user",
@@ -331,13 +331,14 @@ async function buildAiCoachReport(env, analysis) {
               {
                 type: "input_text",
                 text: [
-                  "请为下面这次骑行写一份专业训练分析邮件正文，要求：",
-                  "1. 先给一句总评。",
+                  "请为下面这次骑行写一份专业训练分析邮件正文。邮件前面已经有一块图标化活动快照，所以正文不要重复堆指标，要把指标翻译成训练含义。",
+                  "1. 先给一句有画面感的总评。",
                   "2. 判断本次训练目的和效果。",
                   "3. 分析功率、心率、训练负荷、Power/HR 漂移、近期负荷和健康状态。",
                   "4. 给出明天训练建议、恢复建议、补给建议。",
                   "5. 指出数据缺口，尤其是左右功率、功率区间、峰值功率缺失时要说明。",
-                  "6. 不要说自己是 AI，不要引用 JSON，不要写免责声明。",
+                  "6. 可以少量使用 emoji 或符号，但不要过度花哨。",
+                  "7. 不要说自己是 AI，不要引用 JSON，不要写免责声明。",
                   "",
                   JSON.stringify(analysis, null, 2)
                 ].join("\n")
@@ -381,8 +382,69 @@ function buildRuleCoachReport(analysis) {
   ].join("\n");
 }
 
+function buildLivelySummary(analysis) {
+  const { activity, structure, history, wellness, recovery, dataQuality } = analysis;
+  const recoveryHours = estimateRecoveryHours(activity, recovery, wellness);
+  const statusLine = trainingStatusLine(recovery, history, wellness);
+  const peakLines = peakPowerLines(activity);
+  const zoneLines = compactZoneLines(activity.zoneHints);
+  const heartLine = wellness.available
+    ? `💚 HRV ${format(wellness.hrvToday, 0)}ms｜静息心率 ${format(wellness.restingHrToday, 0)}bpm｜睡眠 ${formatDuration(wellness.sleepTodaySec)}`
+    : "💚 健康数据暂缺，恢复判断主要基于本次训练负荷";
+  const balance = activity.leftRightBalance == null ? "暂无" : `${format(activity.leftRightBalance, 1)} / ${format(100 - activity.leftRightBalance, 1)}`;
+
+  const sections = [
+    {
+      title: "📌 今日训练状态",
+      lines: [
+        `${statusLine.icon} ${statusLine.text}`,
+        `📊 近7天负荷 ${format(history.load7d, 0)}｜近28天负荷 ${format(history.load28d, 0)}｜恢复压力 ${recovery.level}`,
+        heartLine
+      ]
+    },
+    {
+      title: "🚴 骑行总结",
+      lines: [
+        `🎯 ${structure.label}｜${structure.purpose}`,
+        `📍 ${format(activity.distanceKm, 1)}km｜${activity.movingTimeText}｜爬升 ${format(activity.elevationM, 0)}m`,
+        `⚡ 加权功率 ${watts(activity.weightedPowerW)}｜强度 ${format(activity.intensity, 2)}｜负荷 ${format(activity.load, 0)}`,
+        `❤️ 心率 ${format(activity.avgHr, 0)}/${format(activity.maxHr, 0)}bpm｜踏频 ${format(activity.avgCadence, 0)}rpm｜左右 ${balance}`,
+        `✨ 预计恢复时间 ${recoveryHours} 小时`
+      ]
+    },
+    { title: "⚡ 峰值功率", lines: peakLines },
+    { title: "🌈 区间分布", lines: zoneLines },
+    {
+      title: "🔎 数据提示",
+      lines: [
+        dataQuality.note,
+        activity.decouplingPct == null ? "Power/HR 漂移暂无" : `Power/HR 漂移 ${format(activity.decouplingPct, 1)}%，后程心率压力需要留意`
+      ]
+    }
+  ];
+
+  const html = `
+    <section style="background:#f7fbfb;border:1px solid #dcebea;border-radius:12px;padding:16px;margin:0 0 20px">
+      <h3 style="margin:0 0 12px;color:#184e4a">🧾 活动快照</h3>
+      ${sections.map((section) => `
+        <div style="margin:14px 0 0">
+          <div style="font-weight:700;color:#2c3e50;margin-bottom:6px">${section.title}</div>
+          <div style="color:#25313b">${section.lines.map((line) => `<div style="margin:3px 0">${escapeHtml(line)}</div>`).join("")}</div>
+        </div>
+      `).join("")}
+    </section>`;
+
+  const text = [
+    "🧾 活动快照",
+    ...sections.flatMap((section) => [section.title, ...section.lines.map((line) => `- ${line}`), ""])
+  ].join("\n");
+
+  return { html, text };
+}
+
 function buildEmailReport(analysis, aiReport) {
   const { activity, structure, history, wellness, dataQuality } = analysis;
+  const livelySummary = buildLivelySummary(analysis);
   const subject = `骑行分析｜${activity.date} ${format(activity.distanceKm, 1)}km / ${structure.label}`;
   const metrics = [
     ["骑行名称", escapeHtml(activity.name)],
@@ -407,6 +469,7 @@ function buildEmailReport(analysis, aiReport) {
     <main style="font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.6;color:#17202a;max-width:760px">
       <h2 style="margin:0 0 8px">骑行分析｜${activity.date}</h2>
       <p style="margin:0 0 18px;color:#566573">${escapeHtml(activity.name)} · ${aiReport.source}</p>
+      ${livelySummary.html}
       <h3>关键指标</h3>
       <table style="border-collapse:collapse;width:100%;margin-bottom:20px">
         ${metrics.map(([label, value]) => `<tr><td style="border-bottom:1px solid #e5e8e8;padding:8px;color:#566573">${label}</td><td style="border-bottom:1px solid #e5e8e8;padding:8px;text-align:right;font-weight:600">${value}</td></tr>`).join("")}
@@ -414,7 +477,7 @@ function buildEmailReport(analysis, aiReport) {
       ${markdownToHtml(aiReport.markdown)}
       <p style="margin-top:24px;color:#7f8c8d;font-size:12px">数据来自 Garmin/Intervals.icu；AI 只基于结构化指标生成建议，缺失字段不会被推测。</p>
     </main>`;
-  const text = [`骑行分析｜${activity.date}`, "", "关键指标：", ...metrics.map(([label, value]) => `- ${label}: ${stripHtml(value)}`), "", stripMarkdown(aiReport.markdown)].join("\n");
+  const text = [`骑行分析｜${activity.date}`, "", livelySummary.text, "", "关键指标：", ...metrics.map(([label, value]) => `- ${label}: ${stripHtml(value)}`), "", stripMarkdown(aiReport.markdown)].join("\n");
 
   return { subject, html, text };
 }
@@ -502,10 +565,12 @@ function dateRange(daysBack, daysForward) {
 
 function powerPeaks(activity) {
   return {
+    p15s: positiveNumber(activity.power_15s, activity.best_15s, activity.watts_15s, findByKeyHint(activity, ["15", "power"])),
     p5s: positiveNumber(activity.power_5s, activity.best_5s, activity.watts_5s, findByKeyHint(activity, ["5", "power"])),
     p1m: positiveNumber(activity.power_60s, activity.best_60s, activity.watts_60s, findByKeyHint(activity, ["60", "power"])),
     p5m: positiveNumber(activity.power_300s, activity.best_300s, activity.watts_300s, findByKeyHint(activity, ["300", "power"])),
-    p20m: positiveNumber(activity.power_1200s, activity.best_1200s, activity.watts_1200s, findByKeyHint(activity, ["1200", "power"]))
+    p20m: positiveNumber(activity.power_1200s, activity.best_1200s, activity.watts_1200s, findByKeyHint(activity, ["1200", "power"])),
+    p1h: positiveNumber(activity.power_3600s, activity.best_3600s, activity.watts_3600s, findByKeyHint(activity, ["3600", "power"]))
   };
 }
 
@@ -544,6 +609,51 @@ function nutritionAdvice(activity) {
     advice.push("正常饮食即可，注意补水；如果明天有强度课，晚餐保证碳水。");
   }
   return advice;
+}
+
+function trainingStatusLine(recovery, history, wellness) {
+  if (recovery.level === "high") return { icon: "🟠", text: "恢复压力偏高，今天这笔训练刺激值得保留，接下来别急着加码" };
+  if (history.load7d >= 450) return { icon: "🟡", text: "近期训练负荷充实，适合稳住节奏，避免连续堆强度" };
+  if (wellness.hrvDeltaPct != null && wellness.hrvDeltaPct > 10) return { icon: "🟢", text: "恢复信号不错，可以按计划推进训练" };
+  return { icon: "🟢", text: "状态平稳，训练安排可以保持连续性" };
+}
+
+function estimateRecoveryHours(activity, recovery, wellness) {
+  let hours = 10;
+  if (activity.load >= 150) hours += 18;
+  else if (activity.load >= 100) hours += 12;
+  else if (activity.load >= 60) hours += 6;
+  if (activity.intensity >= 0.85) hours += 8;
+  if (activity.decouplingPct != null && activity.decouplingPct > 7) hours += 4;
+  if (wellness.restingHrDelta != null && wellness.restingHrDelta >= 5) hours += 4;
+  if (recovery.level === "high") hours += 4;
+  return Math.min(48, Math.max(8, Math.round(hours)));
+}
+
+function peakPowerLines(activity) {
+  const peaks = [
+    ["15秒", activity.powerPeaks?.p15s],
+    ["1分", activity.powerPeaks?.p1m],
+    ["5分", activity.powerPeaks?.p5m],
+    ["20分", activity.powerPeaks?.p20m],
+    ["1小时", activity.powerPeaks?.p1h]
+  ].filter(([, value]) => value);
+  if (!peaks.length) {
+    const ftpEffort = activity.rawFieldHints?.icu_pm_ftp_watts && activity.rawFieldHints?.icu_pm_ftp_secs
+      ? `⚡ 近似最佳 ${format(activity.rawFieldHints.icu_pm_ftp_secs / 60, 0)}分 ${format(activity.rawFieldHints.icu_pm_ftp_watts, 0)}W`
+      : "⚡ 峰值功率暂缺，Intervals.icu API 没有返回 15秒/1分/5分/20分字段";
+    return [ftpEffort, "💡 后续可以适配活动流数据，做更完整的峰值功率榜"];
+  }
+  return peaks.map(([label, value]) => `⚡ ${label} ${format(value, 0)}W`);
+}
+
+function compactZoneLines(zoneHintsValue) {
+  const zoneHintsObject = zoneHintsValue || {};
+  const entries = Object.entries(zoneHintsObject)
+    .filter(([key, value]) => /z[1-7]|zone/i.test(key) && Number.isFinite(Number(value)))
+    .slice(0, 8);
+  if (!entries.length) return ["🌈 功率区/心率区分布暂缺，当前邮件先展示核心训练负荷和强度"];
+  return entries.map(([key, value]) => `🌈 ${key}: ${format(value, 1)}`);
 }
 
 function extractResponseText(data) {
