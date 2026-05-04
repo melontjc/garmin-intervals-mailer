@@ -5,8 +5,9 @@ const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const CHINA_TIME_ZONE = "Asia/Shanghai";
 
 const CRON_RIDE = "*/30 * * * *";
-const CRON_BODY_MORNING = "20 1 * * *";
-const CRON_BODY_EVENING = "0 13 * * *";
+const CRON_BODY_MORNING_WAKE = "*/15 0-1 * * *";
+const CRON_BODY_MORNING_FALLBACK = "0 2 * * *";
+const CRON_BODY_EVENING = "0 15 * * *";
 
 export default {
   async fetch(request, env) {
@@ -21,6 +22,10 @@ export default {
       return json(await runBodyReport(env, "morning", bodyOptions(url)));
     }
 
+    if (url.pathname === "/run/body/morning/wake") {
+      return json(await runMorningWakeReport(env, bodyOptions(url)));
+    }
+
     if (url.pathname === "/run/body/evening") {
       return json(await runBodyReport(env, "evening", bodyOptions(url)));
     }
@@ -29,7 +34,11 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    if (controller.cron === CRON_BODY_MORNING) {
+    if (controller.cron === CRON_BODY_MORNING_WAKE) {
+      ctx.waitUntil(runMorningWakeReport(env, { force: false, dryRun: false }));
+      return;
+    }
+    if (controller.cron === CRON_BODY_MORNING_FALLBACK) {
       ctx.waitUntil(runBodyReport(env, "morning", { force: false, dryRun: false }));
       return;
     }
@@ -59,7 +68,8 @@ function health(env) {
     },
     schedules: {
       ride: CRON_RIDE,
-      bodyMorning: CRON_BODY_MORNING,
+      bodyMorningWakeCheck: CRON_BODY_MORNING_WAKE,
+      bodyMorningFallback: CRON_BODY_MORNING_FALLBACK,
       bodyEvening: CRON_BODY_EVENING,
       timeZone: CHINA_TIME_ZONE
     }
@@ -114,6 +124,61 @@ async function runRideAnalysis(env, options = {}) {
   }
 
   return { ok: true, module: "ride", sent, skipped, previews, checked: processable.length, aiEnabled: Boolean(env.OPENAI_API_KEY) };
+}
+
+async function runMorningWakeReport(env, options = {}) {
+  requireEnv(env, ["INTERVALS_API_KEY", "RESEND_API_KEY", "RECIPIENT_EMAIL", "RESEND_FROM"]);
+
+  const now = parseDateTime(options.now) || new Date();
+  const reportDate = options.date || chinaDate(now);
+  const kvKey = `sent:body:morning:${reportDate}`;
+  const alreadySent = await env.SENT_ACTIVITIES.get(kvKey);
+
+  if (alreadySent && !options.force) {
+    return { ok: true, module: "body", kind: "morning-wake", date: reportDate, sent: [], skipped: [{ reason: "already-sent", key: kvKey }], previews: [], aiEnabled: Boolean(env.OPENAI_API_KEY) };
+  }
+
+  const ouraRange = dateRangeFromIso(reportDate, 1, 1);
+  const ouraData = await fetchOuraDailyData(env, ouraRange.oldest, ouraRange.newest);
+  const wakeWellness = summarizeOuraWellness(ouraData, reportDate);
+  const wakeTime = parseDateTime(wakeWellness.bedtimeEnd);
+  const sendAfter = wakeTime ? new Date(wakeTime.getTime() + 30 * 60 * 1000) : null;
+  const readyToSend = Boolean(sendAfter && now >= sendAfter);
+
+  if (!readyToSend && !options.force) {
+    return {
+      ok: true,
+      module: "body",
+      kind: "morning-wake",
+      date: reportDate,
+      sent: [],
+      skipped: [{
+        reason: wakeTime ? "waiting-after-wake" : "wake-time-not-ready",
+        bedtimeEnd: wakeWellness.bedtimeEnd || null,
+        sendAfter: sendAfter ? sendAfter.toISOString() : null,
+        now: now.toISOString()
+      }],
+      previews: [],
+      aiEnabled: Boolean(env.OPENAI_API_KEY)
+    };
+  }
+
+  const result = await runBodyReport(env, "morning", {
+    force: options.force,
+    dryRun: options.dryRun,
+    date: reportDate
+  });
+
+  return {
+    ...result,
+    kind: "morning-wake",
+    wakeDecision: {
+      bedtimeEnd: wakeWellness.bedtimeEnd || null,
+      sendAfter: sendAfter ? sendAfter.toISOString() : null,
+      now: now.toISOString(),
+      forced: Boolean(options.force)
+    }
+  };
 }
 
 async function runBodyReport(env, kind, options = {}) {
@@ -1018,7 +1083,8 @@ function bodyOptions(url) {
   return {
     force: boolParam(url, "force"),
     dryRun: boolParam(url, "dry"),
-    date: dateParam(url, "date")
+    date: dateParam(url, "date"),
+    now: url.searchParams.get("now")
   };
 }
 
@@ -1073,6 +1139,12 @@ function chinaDate(date = new Date()) {
 function dateParam(url, name) {
   const value = url.searchParams.get(name);
   return /^\d{4}-\d{2}-\d{2}$/.test(value || "") ? value : null;
+}
+
+function parseDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
 function powerPeaks(activity) {
