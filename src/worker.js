@@ -286,8 +286,11 @@ function summarizeWellness(wellnessDays, activityDateValue) {
     sleepTodaySec: sleepSecToday,
     sleep7dAvgSec: sleep7,
     sleepDebtSec: sleepSecToday && sleep7 ? sleepSecToday - sleep7 : null,
+    sleepScore: firstNumber(current?.sleepScore, current?.sleep_score, current?.oura_sleep_score),
+    sleepQuality: firstNumber(current?.sleepQuality, current?.sleep_quality),
+    avgSleepingHr: rangeNumber(25, 120, current?.avgSleepingHR, current?.avg_sleeping_hr, current?.average_sleeping_hr),
     readiness: firstNumber(current?.readiness, current?.readiness_score, current?.oura_readiness),
-    stress: firstNumber(current?.stress, current?.stress_score, current?.avg_stress),
+    stress: positiveNumber(current?.stress, current?.stress_score, current?.avg_stress),
     bodyBattery: firstNumber(current?.bodyBattery, current?.body_battery, current?.bodyBatteryCharged),
     steps: firstNumber(current?.steps, current?.step_count),
     activeCalories: firstNumber(current?.activeCalories, current?.active_calories),
@@ -482,10 +485,10 @@ function inferRideDataQuality(activity) {
 function inferBodyDataQuality(wellness, activity) {
   const missing = [];
   if (wellness.sleepTodaySec == null) missing.push("睡眠");
+  if (wellness.sleepScore == null) missing.push("睡眠评分");
   if (wellness.hrvToday == null) missing.push("HRV");
   if (wellness.restingHrToday == null) missing.push("静息心率");
   if (wellness.stress == null) missing.push("压力");
-  if (activity.count === 0) missing.push("当天活动");
 
   return {
     completeness: missing.length <= 1 ? "good" : missing.length <= 3 ? "partial" : "poor",
@@ -541,7 +544,7 @@ function aiPrompt(kind, analysis) {
       instructions: "你是一名严谨但表达有活力的晚间身体状态分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，像私人健康教练，专业、轻快、具体，但不过度医疗化。",
       text: [
         "请写一封晚间身体小报正文。邮件前面已有图标化摘要，所以正文要把今天身体承受了什么、今晚怎么睡、明天怎么安排讲清楚。",
-        "要求：1. 一句总评；2. 当天活动/运动负荷解读；3. 压力和恢复趋势；4. 睡前建议；5. 明天训练建议；6. 缺失字段要明确说明；7. 不要说自己是 AI。",
+        "要求：1. 一句总评；2. 当天活动/运动负荷解读，如果 activity.count 为 0，要按日常活动与恢复日分析，不要写成空白或异常；3. 压力和恢复趋势；4. 睡前建议；5. 明天训练建议；6. 缺失字段要明确说明；7. 不要说自己是 AI。",
         "",
         JSON.stringify(analysis, null, 2)
       ].join("\n")
@@ -583,13 +586,17 @@ function buildRuleRideReport(analysis) {
 function buildRuleBodyReport(analysis) {
   const { kind, wellness, activity, status, readiness, dataQuality } = analysis;
   const title = kind === "morning" ? "今日身体状态" : "晚间小报";
+  const activityLine = activity.count
+    ? `今天有 ${activity.count} 项训练/活动，总负荷 ${format(activity.totalLoad, 0)}，运动时长 ${formatDuration(activity.totalDurationSec)}。`
+    : `今天没有训练记录，按日常恢复日处理：步数 ${format(wellness.steps, 0)} 步，睡眠评分 ${format(wellness.sleepScore, 0)}，准备度 ${format(wellness.readiness, 0)}。`;
   return [
     `## ${title}`,
     `${status.icon} ${status.label}。${status.reasons.join(" ")}`,
     "",
     "## 关键解读",
-    `睡眠 ${formatDuration(wellness.sleepTodaySec)}，HRV ${format(wellness.hrvToday, 0)} ms，静息心率 ${format(wellness.restingHrToday, 0)} bpm。`,
-    `当天活动 ${activity.count} 项，总负荷 ${format(activity.totalLoad, 0)}，运动时长 ${formatDuration(activity.totalDurationSec)}。`,
+    `睡眠 ${formatDuration(wellness.sleepTodaySec)}，睡眠评分 ${format(wellness.sleepScore, 0)}，睡眠均心率 ${format(wellness.avgSleepingHr, 0)} bpm。`,
+    `HRV ${format(wellness.hrvToday, 0)} ms，静息心率 ${format(wellness.restingHrToday, 0)} bpm，Oura 准备度 ${format(wellness.readiness, 0)}。`,
+    activityLine,
     "",
     "## 建议",
     ...readiness.training.map((item) => `- ${item}`),
@@ -637,9 +644,22 @@ function buildLivelyRideSummary(analysis) {
 function buildBodySummary(analysis) {
   const { kind, wellness, activity, status, dataQuality } = analysis;
   const title = kind === "morning" ? "🌤️ 晨间身体状态" : "🌙 晚间身体小报";
+  const activityTitle = activity.count ? "📊 当天训练" : "🚶 日常活动与恢复日";
   const activityLines = activity.count
-    ? activity.activities.slice(0, 5).map((item) => `🏃 ${item.name}｜${formatDuration(item.durationSec)}｜负荷 ${format(item.load, 0)}｜强度 ${format(item.intensity, 2)}`)
-    : ["🏃 今天暂无活动/运动记录同步"];
+    ? [
+        `训练 ${activity.count} 项`,
+        `总时长 ${formatDuration(activity.totalDurationSec)}`,
+        `总负荷 ${format(activity.totalLoad, 0)}`,
+        `消耗 ${format(activity.totalCalories, 0)} kcal`,
+        ...activity.activities.slice(0, 4).map((item) => `🏃 ${item.name}｜${formatDuration(item.durationSec)}｜负荷 ${format(item.load, 0)}`)
+      ]
+    : [
+        "今天没有训练记录，按日常恢复日处理",
+        `步数 ${format(wellness.steps, 0)} 步`,
+        `睡眠评分 ${format(wellness.sleepScore, 0)}`,
+        `准备度 ${format(wellness.readiness, 0)}`,
+        wellness.activeCalories == null ? "活动热量 暂无/未同步" : `活动热量 ${format(wellness.activeCalories, 0)} kcal`
+      ];
 
   return summaryBlock(title, [
     ["📌 状态判定", [
@@ -647,12 +667,20 @@ function buildBodySummary(analysis) {
       ...status.reasons.map((reason) => `• ${reason}`)
     ]],
     ["💤 睡眠与恢复", [
-      `睡眠 ${formatDuration(wellness.sleepTodaySec)}｜7日均值 ${formatDuration(wellness.sleep7dAvgSec)}｜睡眠差 ${formatSignedDuration(wellness.sleepDebtSec)}`,
-      `HRV ${format(wellness.hrvToday, 0)}ms｜7日均值 ${format(wellness.hrv7dAvg, 0)}ms｜变化 ${formatSignedPercent(wellness.hrvDeltaPct)}`,
-      `静息心率 ${format(wellness.restingHrToday, 0)}bpm｜7日均值 ${format(wellness.restingHr7dAvg, 0)}bpm｜变化 ${formatSigned(wellness.restingHrDelta, 1)}bpm`
+      `睡眠 ${formatDuration(wellness.sleepTodaySec)}`,
+      `7日均值 ${formatDuration(wellness.sleep7dAvgSec)}`,
+      `睡眠差 ${formatSignedDuration(wellness.sleepDebtSec)}`,
+      `睡眠评分 ${format(wellness.sleepScore, 0)}`,
+      `睡眠均心率 ${format(wellness.avgSleepingHr, 0)} bpm`
     ]],
-    ["📊 当天活动", [
-      `活动 ${activity.count} 项｜总时长 ${formatDuration(activity.totalDurationSec)}｜总负荷 ${format(activity.totalLoad, 0)}｜消耗 ${format(activity.totalCalories, 0)} kcal`,
+    ["💚 HRV 与心率", [
+      `HRV ${format(wellness.hrvToday, 0)} ms`,
+      `HRV 7日均值 ${format(wellness.hrv7dAvg, 0)} ms`,
+      `HRV 变化 ${formatSignedPercent(wellness.hrvDeltaPct)}`,
+      `静息心率 ${format(wellness.restingHrToday, 0)} bpm`,
+      `静息心率变化 ${formatSigned(wellness.restingHrDelta, 1)} bpm`
+    ]],
+    [activityTitle, [
       ...activityLines
     ]],
     ["🔎 数据提示", [
@@ -704,12 +732,16 @@ function buildBodyEmailReport(analysis, aiReport) {
   const metrics = [
     ["状态", `${status.icon} ${status.label}`],
     ["睡眠", formatDuration(wellness.sleepTodaySec)],
+    ["睡眠评分", format(wellness.sleepScore, 0)],
     ["睡眠 7 日均值", formatDuration(wellness.sleep7dAvgSec)],
+    ["睡眠均心率", wellness.avgSleepingHr == null ? "暂无/未同步" : `${format(wellness.avgSleepingHr, 0)} bpm`],
     ["HRV 今日/7日均值", `${format(wellness.hrvToday, 0)} / ${format(wellness.hrv7dAvg, 0)} ms`],
     ["静息心率 今日/7日均值", `${format(wellness.restingHrToday, 0)} / ${format(wellness.restingHr7dAvg, 0)} bpm`],
+    ["Oura 准备度", wellness.readiness == null ? "暂无/未同步" : format(wellness.readiness, 0)],
+    ["步数", wellness.steps == null ? "暂无/未同步" : `${format(wellness.steps, 0)} 步`],
     ["压力指标", wellness.stress == null ? "暂无/未同步" : format(wellness.stress, 0)],
     ["Body Battery/恢复电量", wellness.bodyBattery == null ? "暂无/未同步" : format(wellness.bodyBattery, 0)],
-    ["当天活动数", format(activity.count, 0)],
+    ["训练记录", activity.count ? `${format(activity.count, 0)} 项` : "无训练记录"],
     ["当天总负荷", format(activity.totalLoad, 0)],
     ["当天运动时长", formatDuration(activity.totalDurationSec)],
     ["数据完整度", dataQuality.completeness]
@@ -727,14 +759,14 @@ function buildBodyEmailReport(analysis, aiReport) {
 
 function buildEmailShell({ subject, title, subtitle, summary, metrics, bodyMarkdown }) {
   const html = `
-    <main style="font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.6;color:#17202a;max-width:760px">
-      <h2 style="margin:0 0 8px">${escapeHtml(title)}</h2>
-      <p style="margin:0 0 18px;color:#566573">${subtitle}</p>
+    <main style="font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.6;color:#17202a;max-width:520px;margin:0 auto;padding:0 10px">
+      <h2 style="margin:0 0 8px;font-size:22px;line-height:1.25">${escapeHtml(title)}</h2>
+      <p style="margin:0 0 18px;color:#566573;font-size:14px;line-height:1.45">${subtitle}</p>
       ${summary.html}
-      <h3>关键指标</h3>
-      <table style="border-collapse:collapse;width:100%;margin-bottom:20px">
-        ${metrics.map(([label, value]) => `<tr><td style="border-bottom:1px solid #e5e8e8;padding:8px;color:#566573">${escapeHtml(label)}</td><td style="border-bottom:1px solid #e5e8e8;padding:8px;text-align:right;font-weight:600">${value}</td></tr>`).join("")}
-      </table>
+      <h3 style="margin:18px 0 10px;font-size:17px;line-height:1.3">关键指标</h3>
+      <div style="margin-bottom:20px">
+        ${metrics.map(([label, value]) => metricCard(label, value)).join("")}
+      </div>
       ${markdownToHtml(bodyMarkdown)}
       <p style="margin-top:24px;color:#7f8c8d;font-size:12px">数据来自 Garmin/Oura via Intervals.icu；AI 只基于结构化指标生成建议，缺失字段不会被推测。</p>
     </main>`;
@@ -743,14 +775,22 @@ function buildEmailShell({ subject, title, subtitle, summary, metrics, bodyMarkd
   return { subject, html, text };
 }
 
+function metricCard(label, value) {
+  return `
+    <div style="border:1px solid #e5e8e8;border-radius:10px;padding:9px 11px;margin:7px 0;background:#ffffff">
+      <div style="color:#566573;font-size:12px;line-height:1.25;margin-bottom:3px">${escapeHtml(label)}</div>
+      <div style="font-weight:700;font-size:15px;line-height:1.35;word-break:break-word">${value}</div>
+    </div>`;
+}
+
 function summaryBlock(title, sections) {
   const html = `
-    <section style="background:#f7fbfb;border:1px solid #dcebea;border-radius:12px;padding:16px;margin:0 0 20px">
-      <h3 style="margin:0 0 12px;color:#184e4a">${escapeHtml(title)}</h3>
+    <section style="background:#f7fbfb;border:1px solid #dcebea;border-radius:12px;padding:14px;margin:0 0 18px">
+      <h3 style="margin:0 0 12px;color:#184e4a;font-size:17px;line-height:1.3">${escapeHtml(title)}</h3>
       ${sections.map(([sectionTitle, lines]) => `
-        <div style="margin:14px 0 0">
-          <div style="font-weight:700;color:#2c3e50;margin-bottom:6px">${escapeHtml(sectionTitle)}</div>
-          <div style="color:#25313b">${lines.map((line) => `<div style="margin:3px 0">${escapeHtml(line)}</div>`).join("")}</div>
+        <div style="margin:13px 0 0">
+          <div style="font-weight:700;color:#2c3e50;margin-bottom:6px;font-size:15px;line-height:1.35">${escapeHtml(sectionTitle)}</div>
+          <div style="color:#25313b">${lines.map((line) => `<div style="margin:5px 0;font-size:14px;line-height:1.45;word-break:break-word">${escapeHtml(line)}</div>`).join("")}</div>
         </div>
       `).join("")}
     </section>`;

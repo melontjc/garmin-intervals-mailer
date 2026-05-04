@@ -42,7 +42,8 @@ Cloudflare cron 使用 UTC：
 
 - 睡眠时长、7 日均值、睡眠差。
 - HRV、静息心率、相对 7 日趋势。
-- Intervals.icu wellness 中可用的 Oura/Garmin readiness、stress、Body Battery、steps、active calories 等字段。
+- Intervals.icu wellness 中当前可读的 Oura/Garmin 字段：`sleepSecs`、`sleepScore`、`sleepQuality`、`avgSleepingHR`、`readiness`、`steps`、HRV、静息心率。
+- `stress`、`Body Battery`、`active calories` 等字段如果未同步或为空，邮件中显示“暂无/未同步”。
 - 今日状态：`🟢 可训练`、`🟡 保守推进`、`🟠 优先恢复`。
 - 当日训练强度上限、补水、咖啡因、午休建议。
 
@@ -51,12 +52,19 @@ Cloudflare cron 使用 UTC：
 - 当天所有活动数量、运动时长、训练负荷、强度、消耗。
 - 当天压力/恢复相关 wellness 指标。
 - 今天身体承受了什么、今晚怎么睡、明天怎么安排。
+- 如果当天没有训练记录，不把“无训练”当作数据缺失，改为展示“日常活动与恢复日”，重点呈现步数、睡眠评分、准备度、HRV 和静息心率。
 
 AI 逻辑：
 
 - 使用 OpenAI Responses API，默认模型 `gpt-4.1-mini`。
 - AI 只负责将结构化指标转成更自然的中文分析，不编造缺失字段。
 - AI 调用失败时自动使用规则版 fallback，邮件仍发送。
+
+手机端排版：
+
+- 邮件使用单列布局，主内容宽度控制在适合 iPhone 的范围。
+- 关键指标使用卡片而不是横向表格，避免手机端挤压和横向滚动。
+- 摘要区尽量拆成短行，避免一行塞入过多指标。
 
 ## 验收标准
 
