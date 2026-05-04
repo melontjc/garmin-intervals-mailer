@@ -6,7 +6,7 @@ compatibility_date = "2026-05-03"
 required = ["INTERVALS_API_KEY", "RESEND_API_KEY", "OPENAI_API_KEY"]
 
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["*/30 * * * *", "20 1 * * *", "0 13 * * *"]
 
 [[kv_namespaces]]
 binding = "SENT_ACTIVITIES"

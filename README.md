@@ -1,18 +1,29 @@
-# Garmin -> Intervals.icu -> Email 骑行分析
+# Garmin / Oura -> Intervals.icu -> Email 分析助手
 
-这是一套轻量 Cloudflare Worker 模板：
+这是一个运行在 Cloudflare Workers 上的个人自动分析服务：
 
-1. Garmin Connect 自动同步骑行到 Intervals.icu。
-2. Worker 每 30 分钟查询最近骑行。
-3. 对未发送过的骑行生成中文总结和恢复建议。
+1. Garmin Connect / Oura Ring 数据同步到 Intervals.icu。
+2. Worker 定时读取 Intervals.icu 的 activities 与 wellness 数据。
+3. 生成骑行分析、晨间身体状态、晚间身体小报。
 4. 通过 Resend 发到你的邮箱。
+
+详细身体状态需求见 [docs/body-status-analysis.md](docs/body-status-analysis.md)。
+
+## 功能模块
+
+| 模块 | 触发时间 | 说明 |
+|---|---:|---|
+| 骑行分析 | 每 30 分钟 | 检查新骑行，发现未发送活动后生成 AI/规则分析邮件 |
+| 晨间身体状态 | 北京时间 09:20 | 分析昨夜睡眠、HRV、静息心率和恢复趋势 |
+| 晚间身体小报 | 北京时间 21:00 | 汇总当天活动/运动负荷、压力和睡前/次日建议 |
 
 ## 你需要准备
 
-- Intervals.icu 账号，并连接 Garmin Connect。
+- Intervals.icu 账号，并连接 Garmin Connect / Oura Ring。
 - Intervals.icu API key。
 - Cloudflare 账号。
 - Resend 账号和 API key。
+- OpenAI API key，用于 AI 总结；缺失或失败时会使用规则版 fallback。
 
 ## 本地配置
 
@@ -25,74 +36,80 @@ Copy-Item .dev.vars.example .dev.vars
 然后编辑 `.dev.vars`，填入：
 
 - `INTERVALS_API_KEY`
-- `INTERVALS_ATHLETE_ID`，先用 `0`；如果测试失败，改成 Intervals.icu URL 中的 athlete id
-- `OPENAI_API_KEY`，用于生成 AI 教练分析；不填时会自动使用规则版分析
+- `INTERVALS_ATHLETE_ID`，先用 `0`
+- `OPENAI_API_KEY`
 - `OPENAI_MODEL`，默认 `gpt-4.1-mini`
 - `RESEND_API_KEY`
 - `RECIPIENT_EMAIL`
 - `RESEND_FROM`
 
-## Cloudflare KV
+`.dev.vars` 已被 `.gitignore` 忽略，不能上传到 GitHub。
 
-创建 KV 命名空间，用来记录已经发过邮件的活动，避免重复发送：
+## 手动测试
 
-```powershell
-npx wrangler kv namespace create SENT_ACTIVITIES
-```
-
-把命令输出里的 `id` 填进 `wrangler.toml`。
-
-## 本地测试
+安装依赖：
 
 ```powershell
-npm install
-npm run local-run
+npm.cmd install
 ```
 
-只预览、不发邮件：
+骑行分析 dry-run：
 
 ```powershell
-npm run local-run -- "/run?dry=1&max=1"
+node scripts\local-run.mjs '/run/ride?dry=1&force=1&max=1'
 ```
 
-强制重发最近一条，用来测试邮件模板：
+晨间身体状态 dry-run：
 
 ```powershell
-npm run local-run -- "/run?force=1&max=1"
+node scripts\local-run.mjs '/run/body/morning?dry=1&force=1&date=2026-05-02'
 ```
 
-启动 Worker 开发服务器：
+晚间身体小报 dry-run：
 
 ```powershell
-npm run dev
+node scripts\local-run.mjs '/run/body/evening?dry=1&force=1&date=2026-05-02'
 ```
 
-另开一个终端触发定时任务：
-
-```powershell
-curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
-```
-
-也可以访问：
+浏览器云端测试：
 
 ```text
-http://localhost:8787/health
+https://garmin-intervals-mailer.tanjiachen1127.workers.dev/health
+https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/ride?dry=1&force=1&max=1
+https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/body/morning?dry=1&force=1
+https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/body/evening?dry=1&force=1
 ```
+
+## Cloudflare KV
+
+KV 用于去重，避免重复发送邮件：
+
+```powershell
+npx.cmd wrangler kv namespace create SENT_ACTIVITIES
+```
+
+把输出的 `id` 填进 `wrangler.toml`。
 
 ## 部署
 
 部署前把敏感密钥写入 Cloudflare Workers secrets：
 
 ```powershell
-npx wrangler secret put INTERVALS_API_KEY
-npx wrangler secret put OPENAI_API_KEY
-npx wrangler secret put RESEND_API_KEY
+npx.cmd wrangler secret put INTERVALS_API_KEY
+npx.cmd wrangler secret put OPENAI_API_KEY
+npx.cmd wrangler secret put RESEND_API_KEY
 ```
 
 部署：
 
 ```powershell
-npm run deploy
+npm.cmd run deploy
 ```
 
-部署后 Worker 会按 `wrangler.toml` 中的 cron 每 30 分钟运行一次。
+当前 cron：
+
+```text
+*/30 * * * *   骑行分析
+20 1 * * *     北京时间 09:20 晨报
+0 13 * * *     北京时间 21:00 晚报
+```

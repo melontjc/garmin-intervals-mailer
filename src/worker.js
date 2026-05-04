@@ -1,53 +1,81 @@
 const INTERVALS_BASE_URL = "https://intervals.icu/api/v1";
 const RESEND_URL = "https://api.resend.com/emails";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const CHINA_TIME_ZONE = "Asia/Shanghai";
+
+const CRON_RIDE = "*/30 * * * *";
+const CRON_BODY_MORNING = "20 1 * * *";
+const CRON_BODY_EVENING = "0 13 * * *";
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/health") {
-      return json({
-        ok: true,
-        service: "garmin-intervals-mailer",
-        ai: Boolean(env.OPENAI_API_KEY),
-        bindings: {
-          intervals: "INTERVALS_API_KEY" in env,
-          resend: "RESEND_API_KEY" in env,
-          openai: "OPENAI_API_KEY" in env,
-          openaiModel: env.OPENAI_MODEL || null
-        }
-      });
+    if (url.pathname === "/health") return health(env);
+
+    if (url.pathname === "/run" || url.pathname === "/run/ride") {
+      return json(await runRideAnalysis(env, rideOptions(url)));
     }
-    if (url.pathname === "/run") {
-      const result = await runAnalysis(env, {
-        force: boolParam(url, "force"),
-        dryRun: boolParam(url, "dry"),
-        maxRides: intParam(url, "max", 6)
-      });
-      return json(result);
+
+    if (url.pathname === "/run/body/morning") {
+      return json(await runBodyReport(env, "morning", bodyOptions(url)));
     }
+
+    if (url.pathname === "/run/body/evening") {
+      return json(await runBodyReport(env, "evening", bodyOptions(url)));
+    }
+
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(_controller, env, ctx) {
-    ctx.waitUntil(runAnalysis(env, { force: false, dryRun: false, maxRides: 6 }));
+  async scheduled(controller, env, ctx) {
+    if (controller.cron === CRON_BODY_MORNING) {
+      ctx.waitUntil(runBodyReport(env, "morning", { force: false, dryRun: false }));
+      return;
+    }
+    if (controller.cron === CRON_BODY_EVENING) {
+      ctx.waitUntil(runBodyReport(env, "evening", { force: false, dryRun: false }));
+      return;
+    }
+    ctx.waitUntil(runRideAnalysis(env, { force: false, dryRun: false, maxRides: 6 }));
   }
 };
 
-async function runAnalysis(env, options = {}) {
+function health(env) {
+  return json({
+    ok: true,
+    service: "garmin-intervals-mailer",
+    modules: {
+      rideAnalysis: true,
+      bodyStatus: true
+    },
+    ai: Boolean(env.OPENAI_API_KEY),
+    bindings: {
+      intervals: "INTERVALS_API_KEY" in env,
+      resend: "RESEND_API_KEY" in env,
+      openai: "OPENAI_API_KEY" in env,
+      openaiModel: env.OPENAI_MODEL || null
+    },
+    schedules: {
+      ride: CRON_RIDE,
+      bodyMorning: CRON_BODY_MORNING,
+      bodyEvening: CRON_BODY_EVENING,
+      timeZone: CHINA_TIME_ZONE
+    }
+  });
+}
+
+async function runRideAnalysis(env, options = {}) {
   requireEnv(env, ["INTERVALS_API_KEY", "RESEND_API_KEY", "RECIPIENT_EMAIL", "RESEND_FROM"]);
 
   const athleteId = env.INTERVALS_ATHLETE_ID || "0";
-  const processRange = dateRange(3, 1);
-  const historyRange = dateRange(56, 1);
-  const activities = await intervalsFetch(env, `/athlete/${athleteId}/activities?oldest=${historyRange.oldest}&newest=${historyRange.newest}`);
-  const rides = (Array.isArray(activities) ? activities : [])
-    .filter(isCyclingActivity)
-    .sort(byNewestActivity);
+  const processRange = utcDateRangeAround(new Date(), 3, 1);
+  const historyRange = utcDateRangeAround(new Date(), 56, 1);
+  const activities = await fetchActivities(env, athleteId, historyRange.oldest, historyRange.newest);
+  const rides = activities.filter(isCyclingActivity).sort(byNewestActivity);
+  const wellnessDays = await fetchWellnessRange(env, athleteId, historyRange.oldest, historyRange.newest);
   const processable = rides
     .filter((activity) => inDateRange(activityDate(activity), processRange.oldest, processRange.newest))
     .slice(0, options.maxRides || 6);
-  const wellnessDays = await fetchWellnessRange(env, athleteId, historyRange.oldest, historyRange.newest);
 
   const sent = [];
   const skipped = [];
@@ -69,9 +97,9 @@ async function runAnalysis(env, options = {}) {
 
     const detail = await safeIntervalsFetch(env, `/activity/${activityId}`);
     const activityData = detail && typeof detail === "object" ? { ...activity, ...detail } : activity;
-    const analysis = buildAnalysis(activityData, rides, wellnessDays);
-    const aiReport = await buildAiCoachReport(env, analysis);
-    const report = buildEmailReport(analysis, aiReport);
+    const analysis = buildRideAnalysis(activityData, rides, wellnessDays);
+    const aiReport = await buildAiReport(env, "ride", analysis, buildRuleRideReport(analysis));
+    const report = buildRideEmailReport(analysis, aiReport);
 
     if (options.dryRun) {
       previews.push({ id: activityId, subject: report.subject, analysis, aiReport });
@@ -83,18 +111,52 @@ async function runAnalysis(env, options = {}) {
     sent.push({ id: activityId, name: analysis.activity.name, subject: report.subject, ai: aiReport.source });
   }
 
-  return { ok: true, sent, skipped, previews, checked: processable.length, aiEnabled: Boolean(env.OPENAI_API_KEY) };
+  return { ok: true, module: "ride", sent, skipped, previews, checked: processable.length, aiEnabled: Boolean(env.OPENAI_API_KEY) };
 }
 
-function buildAnalysis(activity, historyRides, wellnessDays) {
+async function runBodyReport(env, kind, options = {}) {
+  requireEnv(env, ["INTERVALS_API_KEY", "RESEND_API_KEY", "RECIPIENT_EMAIL", "RESEND_FROM"]);
+
+  const athleteId = env.INTERVALS_ATHLETE_ID || "0";
+  const reportDate = options.date || chinaDate();
+  const kvKey = `sent:body:${kind}:${reportDate}`;
+  const alreadySent = await env.SENT_ACTIVITIES.get(kvKey);
+
+  if (alreadySent && !options.force) {
+    return { ok: true, module: "body", kind, date: reportDate, sent: [], skipped: [{ reason: "already-sent", key: kvKey }], previews: [], aiEnabled: Boolean(env.OPENAI_API_KEY) };
+  }
+
+  const range = dateRangeFromIso(reportDate, 14, 1);
+  const dayRange = dateRangeFromIso(reportDate, 0, 0);
+  const [wellnessDays, activities] = await Promise.all([
+    fetchWellnessRange(env, athleteId, range.oldest, range.newest),
+    fetchActivities(env, athleteId, dayRange.oldest, dayRange.newest)
+  ]);
+
+  const analysis = buildBodyAnalysis(kind, reportDate, wellnessDays, activities);
+  const fallback = buildRuleBodyReport(analysis);
+  const aiReport = await buildAiReport(env, `body-${kind}`, analysis, fallback);
+  const report = buildBodyEmailReport(analysis, aiReport);
+
+  if (options.dryRun) {
+    return { ok: true, module: "body", kind, date: reportDate, sent: [], skipped: [], previews: [{ subject: report.subject, analysis, aiReport }], aiEnabled: Boolean(env.OPENAI_API_KEY) };
+  }
+
+  await sendEmail(env, report.subject, report.html, report.text);
+  await env.SENT_ACTIVITIES.put(kvKey, new Date().toISOString(), { expirationTtl: 60 * 60 * 24 * 180 });
+  return { ok: true, module: "body", kind, date: reportDate, sent: [{ key: kvKey, subject: report.subject, ai: aiReport.source }], skipped: [], previews: [], aiEnabled: Boolean(env.OPENAI_API_KEY) };
+}
+
+function buildRideAnalysis(activity, historyRides, wellnessDays) {
   const activitySummary = summarizeActivity(activity);
   const history = summarizeHistory(historyRides, activitySummary.date);
   const wellness = summarizeWellness(wellnessDays, activitySummary.date);
   const structure = inferRideStructure(activitySummary);
   const recovery = inferRecovery(activitySummary, history, wellness);
-  const dataQuality = inferDataQuality(activitySummary, activity);
+  const dataQuality = inferRideDataQuality(activitySummary);
 
   return {
+    type: "ride-analysis",
     generatedAt: new Date().toISOString(),
     equipmentContext: {
       heartRate: "Garmin Forerunner 255 as heart-rate source",
@@ -110,6 +172,27 @@ function buildAnalysis(activity, historyRides, wellnessDays) {
   };
 }
 
+function buildBodyAnalysis(kind, date, wellnessDays, activities) {
+  const wellness = summarizeWellness(wellnessDays, date);
+  const dayActivities = activities.filter((activity) => activityDate(activity) === date);
+  const activitySummary = summarizeDailyActivities(dayActivities);
+  const status = inferBodyStatus(kind, wellness, activitySummary);
+  const readiness = bodyReadinessAdvice(kind, status, wellness, activitySummary);
+  const dataQuality = inferBodyDataQuality(wellness, activitySummary);
+
+  return {
+    type: "body-status",
+    kind,
+    date,
+    generatedAt: new Date().toISOString(),
+    wellness,
+    activity: activitySummary,
+    status,
+    readiness,
+    dataQuality
+  };
+}
+
 function summarizeActivity(activity) {
   const date = activityDate(activity);
   const movingTime = seconds(firstNumber(activity.moving_time, activity.elapsed_time, activity.duration));
@@ -118,15 +201,8 @@ function summarizeActivity(activity) {
   const intensity = normalizeIntensity(firstNumber(activity.icu_intensity, activity.intensity, activity.if));
   const avgPower = firstNumber(activity.average_watts, activity.avg_watts, activity.icu_average_watts);
   const weightedPower = firstNumber(activity.weighted_average_watts, activity.normalized_power, activity.icu_weighted_avg_watts, activity.icu_weighted_power);
-  const maxPower = firstNumber(activity.max_watts, activity.max_power);
   const avgHr = firstNumber(activity.average_heartrate, activity.avg_hr, activity.icu_average_heartrate);
   const maxHr = firstNumber(activity.max_heartrate, activity.max_hr);
-  const avgCadence = firstNumber(activity.average_cadence, activity.avg_cadence, activity.icu_average_cadence);
-  const elevation = firstNumber(activity.total_elevation_gain, activity.elevation_gain, activity.icu_elevation);
-  const calories = firstNumber(activity.calories, activity.kcal);
-  const kilojoules = firstNumber(activity.kilojoules, activity.work);
-  const decoupling = normalizePercent(firstNumber(activity.decoupling, activity.power_hr_decoupling, activity.aerobic_decoupling, activity.icu_decoupling));
-  const ftp = firstNumber(activity.ftp, activity.icu_ftp, activity.athlete_ftp);
 
   return {
     id: getActivityId(activity),
@@ -136,19 +212,19 @@ function summarizeActivity(activity) {
     distanceKm,
     movingTimeSec: movingTime,
     movingTimeText: formatDuration(movingTime),
-    elevationM: elevation,
+    elevationM: firstNumber(activity.total_elevation_gain, activity.elevation_gain, activity.icu_elevation),
     avgPowerW: avgPower,
     weightedPowerW: weightedPower,
-    maxPowerW: maxPower,
+    maxPowerW: firstNumber(activity.max_watts, activity.max_power),
     avgHr,
     maxHr,
-    avgCadence,
+    avgCadence: firstNumber(activity.average_cadence, activity.avg_cadence, activity.icu_average_cadence),
     load,
     intensity,
-    calories,
-    kilojoules,
-    decouplingPct: decoupling,
-    ftpW: ftp,
+    calories: firstNumber(activity.calories, activity.kcal),
+    kilojoules: firstNumber(activity.kilojoules, activity.work),
+    decouplingPct: normalizePercent(firstNumber(activity.decoupling, activity.power_hr_decoupling, activity.aerobic_decoupling, activity.icu_decoupling)),
+    ftpW: firstNumber(activity.ftp, activity.icu_ftp, activity.athlete_ftp),
     powerHrEfficiency: avgHr && weightedPower ? weightedPower / avgHr : null,
     leftRightBalance: firstNumber(activity.avg_lr_balance, activity.left_right_balance, activity.lr_balance, findByKeyHint(activity, ["balance"])),
     powerPeaks: powerPeaks(activity),
@@ -162,9 +238,9 @@ function summarizeHistory(rides, activityDateValue) {
   const last7 = previous.filter((ride) => daysBetween(activityDate(ride), activityDateValue) <= 7);
   const last28 = previous.filter((ride) => daysBetween(activityDate(ride), activityDateValue) <= 28);
   const last42 = previous.filter((ride) => daysBetween(activityDate(ride), activityDateValue) <= 42);
-  const loads7 = last7.map((ride) => firstNumber(ride.icu_training_load, ride.training_load, ride.tss)).filter(isNumber);
-  const loads28 = last28.map((ride) => firstNumber(ride.icu_training_load, ride.training_load, ride.tss)).filter(isNumber);
-  const intensities28 = last28.map((ride) => normalizeIntensity(firstNumber(ride.icu_intensity, ride.intensity, ride.if))).filter(isNumber);
+  const loads7 = last7.map(activityLoad).filter(isNumber);
+  const loads28 = last28.map(activityLoad).filter(isNumber);
+  const intensities28 = last28.map(activityIntensity).filter(isNumber);
 
   return {
     rides7d: last7.length,
@@ -174,20 +250,19 @@ function summarizeHistory(rides, activityDateValue) {
     avgLoad28d: average(loads28),
     avgIntensity28d: average(intensities28),
     loadRamp: loads28.length ? sum(loads7) - sum(loads28) / 4 : null,
-    recentHighLoadCount: last28.filter((ride) => firstNumber(ride.icu_training_load, ride.training_load, ride.tss) >= 100).length,
+    recentHighLoadCount: last28.filter((ride) => activityLoad(ride) >= 100).length,
     recentRides: last42.slice(0, 8).map((ride) => ({
       date: activityDate(ride),
       name: ride.name || "骑行",
       distanceKm: km(firstNumber(ride.distance, ride.icu_distance)),
-      load: firstNumber(ride.icu_training_load, ride.training_load, ride.tss),
-      intensity: normalizeIntensity(firstNumber(ride.icu_intensity, ride.intensity, ride.if))
+      load: activityLoad(ride),
+      intensity: activityIntensity(ride)
     }))
   };
 }
 
 function summarizeWellness(wellnessDays, activityDateValue) {
-  const days = Array.isArray(wellnessDays) ? wellnessDays : [];
-  const dated = days
+  const dated = (Array.isArray(wellnessDays) ? wellnessDays : [])
     .map((item) => ({ ...item, date: localDate(item.id || item.date || item.day || item.start_date || "") }))
     .filter((item) => item.date);
   const current = dated.find((item) => item.date === activityDateValue) || null;
@@ -210,7 +285,39 @@ function summarizeWellness(wellnessDays, activityDateValue) {
     restingHrDelta: restingHrToday && restingHr7 ? restingHrToday - restingHr7 : null,
     sleepTodaySec: sleepSecToday,
     sleep7dAvgSec: sleep7,
-    sleepDebtSec: sleepSecToday && sleep7 ? sleepSecToday - sleep7 : null
+    sleepDebtSec: sleepSecToday && sleep7 ? sleepSecToday - sleep7 : null,
+    readiness: firstNumber(current?.readiness, current?.readiness_score, current?.oura_readiness),
+    stress: firstNumber(current?.stress, current?.stress_score, current?.avg_stress),
+    bodyBattery: firstNumber(current?.bodyBattery, current?.body_battery, current?.bodyBatteryCharged),
+    steps: firstNumber(current?.steps, current?.step_count),
+    activeCalories: firstNumber(current?.activeCalories, current?.active_calories),
+    rawHints: current ? wellnessHints(current) : {}
+  };
+}
+
+function summarizeDailyActivities(activities) {
+  const summaries = activities.map((activity) => ({
+    id: getActivityId(activity),
+    name: activity.name || activity.type || "活动",
+    type: activity.type || activity.sport || activity.icu_sport || "activity",
+    durationSec: seconds(firstNumber(activity.moving_time, activity.elapsed_time, activity.duration)),
+    distanceKm: km(firstNumber(activity.distance, activity.icu_distance)),
+    load: activityLoad(activity),
+    intensity: activityIntensity(activity),
+    calories: firstNumber(activity.calories, activity.kcal),
+    avgHr: firstNumber(activity.average_heartrate, activity.avg_hr, activity.icu_average_heartrate)
+  }));
+  const loads = summaries.map((item) => item.load).filter(isNumber);
+  const intensities = summaries.map((item) => item.intensity).filter(isNumber);
+
+  return {
+    count: summaries.length,
+    totalDurationSec: sum(summaries.map((item) => item.durationSec).filter(isNumber)),
+    totalDistanceKm: sum(summaries.map((item) => item.distanceKm).filter(isNumber)),
+    totalLoad: sum(loads),
+    maxIntensity: intensities.length ? Math.max(...intensities) : null,
+    totalCalories: sum(summaries.map((item) => item.calories).filter(isNumber)),
+    activities: summaries
   };
 }
 
@@ -225,7 +332,7 @@ function inferRideStructure(activity) {
     purpose = "数据不足，优先检查功率计和心率数据完整性";
   } else if (intensity >= 0.9) {
     label = "高强度/比赛式刺激";
-    purpose = "明显推动疲劳和适应，适合作为重点训练日";
+    purpose = "明显推动强度适应，适合作为重点训练日";
   } else if (load >= 130 && intensity < 0.75) {
     label = "长距离高负荷耐力骑";
     purpose = "以时间和爬升累积训练压力，主要刺激耐力和抗疲劳能力";
@@ -234,7 +341,7 @@ function inferRideStructure(activity) {
     purpose = "训练负荷较高，对疲劳和适应都有明显推动";
   } else if (intensity >= 0.84) {
     label = "阈值/甜区训练";
-    purpose = "提升持续输出能力和乳酸阈附近耐受";
+    purpose = "提升持续输出能力和阈值附近耐受";
   } else if (intensity >= 0.72) {
     label = "节奏/甜区偏下";
     purpose = "兼顾耐力和肌肉耐受，疲劳中等";
@@ -293,7 +400,70 @@ function inferRecovery(activity, history, wellness) {
   };
 }
 
-function inferDataQuality(activity, raw) {
+function inferBodyStatus(kind, wellness, activity) {
+  let score = 0;
+  const reasons = [];
+
+  if (!wellness.available) {
+    reasons.push("当天 wellness 数据未同步完整。");
+  }
+  if (wellness.sleepTodaySec != null && wellness.sleepTodaySec < 6 * 60 * 60) {
+    score -= 2;
+    reasons.push("睡眠时长不足 6 小时。");
+  }
+  if (wellness.hrvDeltaPct != null && wellness.hrvDeltaPct < -12) {
+    score -= 2;
+    reasons.push("HRV 明显低于近 7 日均值。");
+  } else if (wellness.hrvDeltaPct != null && wellness.hrvDeltaPct > 10) {
+    score += 1;
+    reasons.push("HRV 高于近 7 日均值，恢复信号不错。");
+  }
+  if (wellness.restingHrDelta != null && wellness.restingHrDelta >= 5) {
+    score -= 2;
+    reasons.push("静息心率高于近 7 日均值。");
+  }
+  if (activity.totalLoad >= 120) {
+    score -= kind === "evening" ? 2 : 1;
+    reasons.push("当天训练负荷较高。");
+  }
+  if (activity.totalLoad >= 60 && activity.totalLoad < 120) {
+    score -= 1;
+    reasons.push("当天存在中等训练刺激。");
+  }
+
+  if (score <= -3) return { label: "优先恢复", icon: "🟠", score, reasons };
+  if (score <= -1) return { label: "保守推进", icon: "🟡", score, reasons };
+  return { label: "可训练", icon: "🟢", score, reasons: reasons.length ? reasons : ["关键恢复指标整体平稳。"] };
+}
+
+function bodyReadinessAdvice(kind, status, wellness, activity) {
+  const morning = kind === "morning";
+  const training = [];
+  const recovery = [];
+  const sleep = [];
+
+  if (status.label === "优先恢复") {
+    training.push(morning ? "今天不安排高强度训练，最多做轻松有氧或活动恢复。" : "明天优先恢复，若训练也只做 Z1-Z2。");
+  } else if (status.label === "保守推进") {
+    training.push(morning ? "今天可以训练，但建议把强度上限控制在有氧/节奏以下。" : "明天可以按计划推进，但先用热身状态决定是否加强度。");
+  } else {
+    training.push(morning ? "今天身体信号允许正常训练，仍建议用热身心率确认状态。" : "明天可以按计划训练，注意别连续堆叠高负荷。");
+  }
+
+  if (wellness.sleepTodaySec != null && wellness.sleepTodaySec < 6.5 * 60 * 60) {
+    recovery.push("白天安排 15-25 分钟短午休，避免傍晚后摄入咖啡因。");
+  } else {
+    recovery.push("保持补水和规律进食，午后避免额外压力堆叠。");
+  }
+  if (activity.totalLoad >= 80) {
+    recovery.push("训练后补充碳水和 20-40g 蛋白质，晚餐不要过度压缩碳水。");
+  }
+  sleep.push(morning ? "今晚优先保证固定入睡时间。" : "睡前 60 分钟降低屏幕和工作刺激，给 HRV 一个更好的恢复窗口。");
+
+  return { training, recovery, sleep };
+}
+
+function inferRideDataQuality(activity) {
   const missing = [];
   if (!activity.avgPowerW) missing.push("平均功率");
   if (!activity.weightedPowerW) missing.push("标准化/加权功率");
@@ -309,11 +479,26 @@ function inferDataQuality(activity, raw) {
   };
 }
 
-async function buildAiCoachReport(env, analysis) {
-  const fallback = buildRuleCoachReport(analysis);
+function inferBodyDataQuality(wellness, activity) {
+  const missing = [];
+  if (wellness.sleepTodaySec == null) missing.push("睡眠");
+  if (wellness.hrvToday == null) missing.push("HRV");
+  if (wellness.restingHrToday == null) missing.push("静息心率");
+  if (wellness.stress == null) missing.push("压力");
+  if (activity.count === 0) missing.push("当天活动");
+
+  return {
+    completeness: missing.length <= 1 ? "good" : missing.length <= 3 ? "partial" : "poor",
+    missing,
+    note: missing.length ? `未同步/暂缺：${missing.join("、")}。本邮件只基于已同步字段分析。` : "身体状态关键字段完整。"
+  };
+}
+
+async function buildAiReport(env, kind, analysis, fallback) {
   if (!env.OPENAI_API_KEY) return { source: "rules", markdown: fallback };
 
   try {
+    const prompt = aiPrompt(kind, analysis);
     const res = await fetch(OPENAI_RESPONSES_URL, {
       method: "POST",
       headers: {
@@ -323,29 +508,8 @@ async function buildAiCoachReport(env, analysis) {
       body: JSON.stringify({
         model: env.OPENAI_MODEL || "gpt-4.1-mini",
         max_output_tokens: 1600,
-        instructions: "你是一名严谨但表达有活力的自行车训练分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，结构清晰，给出具体但不过度医疗化的训练和恢复建议。语气可以像私人教练，专业、轻快、有一点鼓励感。",
-        input: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text: [
-                  "请为下面这次骑行写一份专业训练分析邮件正文。邮件前面已经有一块图标化活动快照，所以正文不要重复堆指标，要把指标翻译成训练含义。",
-                  "1. 先给一句有画面感的总评。",
-                  "2. 判断本次训练目的和效果。",
-                  "3. 分析功率、心率、训练负荷、Power/HR 漂移、近期负荷和健康状态。",
-                  "4. 给出明天训练建议、恢复建议、补给建议。",
-                  "5. 指出数据缺口，尤其是左右功率、功率区间、峰值功率缺失时要说明。",
-                  "6. 可以少量使用 emoji 或符号，但不要过度花哨。",
-                  "7. 不要说自己是 AI，不要引用 JSON，不要写免责声明。",
-                  "",
-                  JSON.stringify(analysis, null, 2)
-                ].join("\n")
-              }
-            ]
-          }
-        ]
+        instructions: prompt.instructions,
+        input: [{ role: "user", content: [{ type: "input_text", text: prompt.text }] }]
       })
     });
     if (!res.ok) {
@@ -360,29 +524,84 @@ async function buildAiCoachReport(env, analysis) {
   }
 }
 
-function buildRuleCoachReport(analysis) {
+function aiPrompt(kind, analysis) {
+  if (kind === "body-morning") {
+    return {
+      instructions: "你是一名严谨但表达有活力的身体状态分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，像私人健康教练，专业、轻快、具体，但不过度医疗化。",
+      text: [
+        "请写一封晨间身体状态分析邮件正文。邮件前面已有图标化摘要，所以正文不要重复堆指标，要解释这些指标对今天安排的含义。",
+        "要求：1. 一句总评；2. 睡眠/HRV/静息心率解读；3. 今日训练强度上限；4. 补水、咖啡因、午休建议；5. 缺失字段要明确说明；6. 不要说自己是 AI。",
+        "",
+        JSON.stringify(analysis, null, 2)
+      ].join("\n")
+    };
+  }
+  if (kind === "body-evening") {
+    return {
+      instructions: "你是一名严谨但表达有活力的晚间身体状态分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，像私人健康教练，专业、轻快、具体，但不过度医疗化。",
+      text: [
+        "请写一封晚间身体小报正文。邮件前面已有图标化摘要，所以正文要把今天身体承受了什么、今晚怎么睡、明天怎么安排讲清楚。",
+        "要求：1. 一句总评；2. 当天活动/运动负荷解读；3. 压力和恢复趋势；4. 睡前建议；5. 明天训练建议；6. 缺失字段要明确说明；7. 不要说自己是 AI。",
+        "",
+        JSON.stringify(analysis, null, 2)
+      ].join("\n")
+    };
+  }
+  return {
+    instructions: "你是一名严谨但表达有活力的自行车训练分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，结构清晰，给出具体但不过度医疗化的训练和恢复建议。语气可以像私人教练，专业、轻快、有一点鼓励感。",
+    text: [
+      "请为下面这次骑行写一份专业训练分析邮件正文。邮件前面已经有一块图标化活动快照，所以正文不要重复堆指标，要把指标翻译成训练含义。",
+      "要求：1. 一句有画面感的总评；2. 判断训练目的和效果；3. 分析功率、心率、训练负荷、Power/HR 漂移、近期负荷和健康状态；4. 给出明天训练、恢复、补给建议；5. 指出数据缺口；6. 不要说自己是 AI。",
+      "",
+      JSON.stringify(analysis, null, 2)
+    ].join("\n")
+  };
+}
+
+function buildRuleRideReport(analysis) {
   const { activity, structure, history, wellness, recovery, dataQuality } = analysis;
   return [
-    `## 总评`,
-    `这次是一次${structure.label}，主要目的偏向${structure.purpose}。训练负荷为 ${format(activity.load, 0)}，强度系数为 ${format(activity.intensity, 2)}，整体恢复压力判断为 ${recovery.level}。`,
+    "## 总评",
+    `这次是一次${structure.label}，主要目的偏向${structure.purpose}。训练负荷为 ${format(activity.load, 0)}，强度系数为 ${format(activity.intensity, 2)}，整体恢复压力为 ${recovery.level}。`,
     "",
-    `## 训练解读`,
+    "## 训练解读",
     `距离 ${format(activity.distanceKm, 1)} km，移动时间 ${activity.movingTimeText}，加权功率 ${watts(activity.weightedPowerW)}，平均心率 ${format(activity.avgHr, 0)} bpm。`,
     ...structure.notes.map((note) => `- ${note}`),
     `近 7 天训练负荷约 ${format(history.load7d, 0)}，近 28 天训练负荷约 ${format(history.load28d, 0)}。`,
     "",
-    `## 明天建议`,
+    "## 明天建议",
     ...recovery.nextDay.map((item) => `- ${item}`),
     `- ${recovery.sleep}`,
     ...recovery.nutrition.map((item) => `- ${item}`),
     "",
-    `## 数据质量`,
+    "## 数据质量",
     `- ${dataQuality.note}`,
-    wellness.available ? `- HRV 今日 ${format(wellness.hrvToday, 0)} ms，静息心率 ${format(wellness.restingHrToday, 0)} bpm，睡眠 ${formatDuration(wellness.sleepTodaySec)}。` : "- 未读取到当天 Garmin 健康数据。"
+    wellness.available ? `- HRV 今日 ${format(wellness.hrvToday, 0)} ms，静息心率 ${format(wellness.restingHrToday, 0)} bpm，睡眠 ${formatDuration(wellness.sleepTodaySec)}。` : "- 未读取到当天 Garmin/Oura 健康数据。"
   ].join("\n");
 }
 
-function buildLivelySummary(analysis) {
+function buildRuleBodyReport(analysis) {
+  const { kind, wellness, activity, status, readiness, dataQuality } = analysis;
+  const title = kind === "morning" ? "今日身体状态" : "晚间小报";
+  return [
+    `## ${title}`,
+    `${status.icon} ${status.label}。${status.reasons.join(" ")}`,
+    "",
+    "## 关键解读",
+    `睡眠 ${formatDuration(wellness.sleepTodaySec)}，HRV ${format(wellness.hrvToday, 0)} ms，静息心率 ${format(wellness.restingHrToday, 0)} bpm。`,
+    `当天活动 ${activity.count} 项，总负荷 ${format(activity.totalLoad, 0)}，运动时长 ${formatDuration(activity.totalDurationSec)}。`,
+    "",
+    "## 建议",
+    ...readiness.training.map((item) => `- ${item}`),
+    ...readiness.recovery.map((item) => `- ${item}`),
+    ...readiness.sleep.map((item) => `- ${item}`),
+    "",
+    "## 数据质量",
+    `- ${dataQuality.note}`
+  ].join("\n");
+}
+
+function buildLivelyRideSummary(analysis) {
   const { activity, structure, history, wellness, recovery, dataQuality } = analysis;
   const recoveryHours = estimateRecoveryHours(activity, recovery, wellness);
   const statusLine = trainingStatusLine(recovery, history, wellness);
@@ -393,58 +612,60 @@ function buildLivelySummary(analysis) {
     : "💚 健康数据暂缺，恢复判断主要基于本次训练负荷";
   const balance = activity.leftRightBalance == null ? "暂无" : `${format(activity.leftRightBalance, 1)} / ${format(100 - activity.leftRightBalance, 1)}`;
 
-  const sections = [
-    {
-      title: "📌 今日训练状态",
-      lines: [
-        `${statusLine.icon} ${statusLine.text}`,
-        `📊 近7天负荷 ${format(history.load7d, 0)}｜近28天负荷 ${format(history.load28d, 0)}｜恢复压力 ${recovery.level}`,
-        heartLine
-      ]
-    },
-    {
-      title: "🚴 骑行总结",
-      lines: [
-        `🎯 ${structure.label}｜${structure.purpose}`,
-        `📍 ${format(activity.distanceKm, 1)}km｜${activity.movingTimeText}｜爬升 ${format(activity.elevationM, 0)}m`,
-        `⚡ 加权功率 ${watts(activity.weightedPowerW)}｜强度 ${format(activity.intensity, 2)}｜负荷 ${format(activity.load, 0)}`,
-        `❤️ 心率 ${format(activity.avgHr, 0)}/${format(activity.maxHr, 0)}bpm｜踏频 ${format(activity.avgCadence, 0)}rpm｜左右 ${balance}`,
-        `✨ 预计恢复时间 ${recoveryHours} 小时`
-      ]
-    },
-    { title: "⚡ 峰值功率", lines: peakLines },
-    { title: "🌈 区间分布", lines: zoneLines },
-    {
-      title: "🔎 数据提示",
-      lines: [
-        dataQuality.note,
-        activity.decouplingPct == null ? "Power/HR 漂移暂无" : `Power/HR 漂移 ${format(activity.decouplingPct, 1)}%，后程心率压力需要留意`
-      ]
-    }
-  ];
-
-  const html = `
-    <section style="background:#f7fbfb;border:1px solid #dcebea;border-radius:12px;padding:16px;margin:0 0 20px">
-      <h3 style="margin:0 0 12px;color:#184e4a">🧾 活动快照</h3>
-      ${sections.map((section) => `
-        <div style="margin:14px 0 0">
-          <div style="font-weight:700;color:#2c3e50;margin-bottom:6px">${section.title}</div>
-          <div style="color:#25313b">${section.lines.map((line) => `<div style="margin:3px 0">${escapeHtml(line)}</div>`).join("")}</div>
-        </div>
-      `).join("")}
-    </section>`;
-
-  const text = [
-    "🧾 活动快照",
-    ...sections.flatMap((section) => [section.title, ...section.lines.map((line) => `- ${line}`), ""])
-  ].join("\n");
-
-  return { html, text };
+  return summaryBlock("🧾 活动快照", [
+    ["📌 今日训练状态", [
+      `${statusLine.icon} ${statusLine.text}`,
+      `📊 近7天负荷 ${format(history.load7d, 0)}｜近28天负荷 ${format(history.load28d, 0)}｜恢复压力 ${recovery.level}`,
+      heartLine
+    ]],
+    ["🚴 骑行总结", [
+      `🎯 ${structure.label}｜${structure.purpose}`,
+      `📍 ${format(activity.distanceKm, 1)}km｜${activity.movingTimeText}｜爬升 ${format(activity.elevationM, 0)}m`,
+      `⚡ 加权功率 ${watts(activity.weightedPowerW)}｜强度 ${format(activity.intensity, 2)}｜负荷 ${format(activity.load, 0)}`,
+      `❤️ 心率 ${format(activity.avgHr, 0)}/${format(activity.maxHr, 0)}bpm｜踏频 ${format(activity.avgCadence, 0)}rpm｜左右 ${balance}`,
+      `✨ 预计恢复时间 ${recoveryHours} 小时`
+    ]],
+    ["⚡ 峰值功率", peakLines],
+    ["🌈 区间分布", zoneLines],
+    ["🔎 数据提示", [
+      dataQuality.note,
+      activity.decouplingPct == null ? "Power/HR 漂移暂无" : `Power/HR 漂移 ${format(activity.decouplingPct, 1)}%，后程心率压力需要留意`
+    ]]
+  ]);
 }
 
-function buildEmailReport(analysis, aiReport) {
+function buildBodySummary(analysis) {
+  const { kind, wellness, activity, status, dataQuality } = analysis;
+  const title = kind === "morning" ? "🌤️ 晨间身体状态" : "🌙 晚间身体小报";
+  const activityLines = activity.count
+    ? activity.activities.slice(0, 5).map((item) => `🏃 ${item.name}｜${formatDuration(item.durationSec)}｜负荷 ${format(item.load, 0)}｜强度 ${format(item.intensity, 2)}`)
+    : ["🏃 今天暂无活动/运动记录同步"];
+
+  return summaryBlock(title, [
+    ["📌 状态判定", [
+      `${status.icon} ${status.label}`,
+      ...status.reasons.map((reason) => `• ${reason}`)
+    ]],
+    ["💤 睡眠与恢复", [
+      `睡眠 ${formatDuration(wellness.sleepTodaySec)}｜7日均值 ${formatDuration(wellness.sleep7dAvgSec)}｜睡眠差 ${formatSignedDuration(wellness.sleepDebtSec)}`,
+      `HRV ${format(wellness.hrvToday, 0)}ms｜7日均值 ${format(wellness.hrv7dAvg, 0)}ms｜变化 ${formatSignedPercent(wellness.hrvDeltaPct)}`,
+      `静息心率 ${format(wellness.restingHrToday, 0)}bpm｜7日均值 ${format(wellness.restingHr7dAvg, 0)}bpm｜变化 ${formatSigned(wellness.restingHrDelta, 1)}bpm`
+    ]],
+    ["📊 当天活动", [
+      `活动 ${activity.count} 项｜总时长 ${formatDuration(activity.totalDurationSec)}｜总负荷 ${format(activity.totalLoad, 0)}｜消耗 ${format(activity.totalCalories, 0)} kcal`,
+      ...activityLines
+    ]],
+    ["🔎 数据提示", [
+      dataQuality.note,
+      wellness.stress == null ? "压力指标未同步" : `压力指标 ${format(wellness.stress, 0)}`,
+      wellness.bodyBattery == null ? "Body Battery/恢复电量未同步" : `Body Battery/恢复电量 ${format(wellness.bodyBattery, 0)}`
+    ]]
+  ]);
+}
+
+function buildRideEmailReport(analysis, aiReport) {
   const { activity, structure, history, wellness, dataQuality } = analysis;
-  const livelySummary = buildLivelySummary(analysis);
+  const livelySummary = buildLivelyRideSummary(analysis);
   const subject = `骑行分析｜${activity.date} ${format(activity.distanceKm, 1)}km / ${structure.label}`;
   const metrics = [
     ["骑行名称", escapeHtml(activity.name)],
@@ -465,21 +686,76 @@ function buildEmailReport(analysis, aiReport) {
     ["数据完整度", dataQuality.completeness]
   ];
 
+  return buildEmailShell({
+    subject,
+    title: `骑行分析｜${activity.date}`,
+    subtitle: `${escapeHtml(activity.name)} · ${aiReport.source}`,
+    summary: livelySummary,
+    metrics,
+    bodyMarkdown: aiReport.markdown
+  });
+}
+
+function buildBodyEmailReport(analysis, aiReport) {
+  const { kind, date, status, wellness, activity, dataQuality } = analysis;
+  const isMorning = kind === "morning";
+  const subject = `${isMorning ? "晨间身体状态" : "晚间身体小报"}｜${date} ${status.icon} ${status.label}`;
+  const summary = buildBodySummary(analysis);
+  const metrics = [
+    ["状态", `${status.icon} ${status.label}`],
+    ["睡眠", formatDuration(wellness.sleepTodaySec)],
+    ["睡眠 7 日均值", formatDuration(wellness.sleep7dAvgSec)],
+    ["HRV 今日/7日均值", `${format(wellness.hrvToday, 0)} / ${format(wellness.hrv7dAvg, 0)} ms`],
+    ["静息心率 今日/7日均值", `${format(wellness.restingHrToday, 0)} / ${format(wellness.restingHr7dAvg, 0)} bpm`],
+    ["压力指标", wellness.stress == null ? "暂无/未同步" : format(wellness.stress, 0)],
+    ["Body Battery/恢复电量", wellness.bodyBattery == null ? "暂无/未同步" : format(wellness.bodyBattery, 0)],
+    ["当天活动数", format(activity.count, 0)],
+    ["当天总负荷", format(activity.totalLoad, 0)],
+    ["当天运动时长", formatDuration(activity.totalDurationSec)],
+    ["数据完整度", dataQuality.completeness]
+  ];
+
+  return buildEmailShell({
+    subject,
+    title: `${isMorning ? "晨间身体状态" : "晚间身体小报"}｜${date}`,
+    subtitle: `${status.icon} ${status.label} · ${aiReport.source}`,
+    summary,
+    metrics,
+    bodyMarkdown: aiReport.markdown
+  });
+}
+
+function buildEmailShell({ subject, title, subtitle, summary, metrics, bodyMarkdown }) {
   const html = `
     <main style="font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.6;color:#17202a;max-width:760px">
-      <h2 style="margin:0 0 8px">骑行分析｜${activity.date}</h2>
-      <p style="margin:0 0 18px;color:#566573">${escapeHtml(activity.name)} · ${aiReport.source}</p>
-      ${livelySummary.html}
+      <h2 style="margin:0 0 8px">${escapeHtml(title)}</h2>
+      <p style="margin:0 0 18px;color:#566573">${subtitle}</p>
+      ${summary.html}
       <h3>关键指标</h3>
       <table style="border-collapse:collapse;width:100%;margin-bottom:20px">
-        ${metrics.map(([label, value]) => `<tr><td style="border-bottom:1px solid #e5e8e8;padding:8px;color:#566573">${label}</td><td style="border-bottom:1px solid #e5e8e8;padding:8px;text-align:right;font-weight:600">${value}</td></tr>`).join("")}
+        ${metrics.map(([label, value]) => `<tr><td style="border-bottom:1px solid #e5e8e8;padding:8px;color:#566573">${escapeHtml(label)}</td><td style="border-bottom:1px solid #e5e8e8;padding:8px;text-align:right;font-weight:600">${value}</td></tr>`).join("")}
       </table>
-      ${markdownToHtml(aiReport.markdown)}
-      <p style="margin-top:24px;color:#7f8c8d;font-size:12px">数据来自 Garmin/Intervals.icu；AI 只基于结构化指标生成建议，缺失字段不会被推测。</p>
+      ${markdownToHtml(bodyMarkdown)}
+      <p style="margin-top:24px;color:#7f8c8d;font-size:12px">数据来自 Garmin/Oura via Intervals.icu；AI 只基于结构化指标生成建议，缺失字段不会被推测。</p>
     </main>`;
-  const text = [`骑行分析｜${activity.date}`, "", livelySummary.text, "", "关键指标：", ...metrics.map(([label, value]) => `- ${label}: ${stripHtml(value)}`), "", stripMarkdown(aiReport.markdown)].join("\n");
+  const text = [title, "", stripHtml(subtitle), "", summary.text, "", "关键指标：", ...metrics.map(([label, value]) => `- ${label}: ${stripHtml(value)}`), "", stripMarkdown(bodyMarkdown)].join("\n");
 
   return { subject, html, text };
+}
+
+function summaryBlock(title, sections) {
+  const html = `
+    <section style="background:#f7fbfb;border:1px solid #dcebea;border-radius:12px;padding:16px;margin:0 0 20px">
+      <h3 style="margin:0 0 12px;color:#184e4a">${escapeHtml(title)}</h3>
+      ${sections.map(([sectionTitle, lines]) => `
+        <div style="margin:14px 0 0">
+          <div style="font-weight:700;color:#2c3e50;margin-bottom:6px">${escapeHtml(sectionTitle)}</div>
+          <div style="color:#25313b">${lines.map((line) => `<div style="margin:3px 0">${escapeHtml(line)}</div>`).join("")}</div>
+        </div>
+      `).join("")}
+    </section>`;
+  const text = [title, ...sections.flatMap(([sectionTitle, lines]) => [sectionTitle, ...lines.map((line) => `- ${line}`), ""])].join("\n");
+  return { html, text };
 }
 
 async function intervalsFetch(env, path) {
@@ -502,6 +778,11 @@ async function safeIntervalsFetch(env, path) {
   } catch (_error) {
     return null;
   }
+}
+
+async function fetchActivities(env, athleteId, oldest, newest) {
+  const data = await intervalsFetch(env, `/athlete/${athleteId}/activities?oldest=${oldest}&newest=${newest}`);
+  return Array.isArray(data) ? data : [];
 }
 
 async function fetchWellnessRange(env, athleteId, oldest, newest) {
@@ -533,9 +814,33 @@ async function sendEmail(env, subject, html, text) {
   return res.json();
 }
 
+function rideOptions(url) {
+  return {
+    force: boolParam(url, "force"),
+    dryRun: boolParam(url, "dry"),
+    maxRides: intParam(url, "max", 6)
+  };
+}
+
+function bodyOptions(url) {
+  return {
+    force: boolParam(url, "force"),
+    dryRun: boolParam(url, "dry"),
+    date: dateParam(url, "date")
+  };
+}
+
 function isCyclingActivity(activity) {
   const type = String(activity.type || activity.sport || activity.icu_sport || "").toLowerCase();
   return ["ride", "virtualride", "cycling", "biking", "mountainbike", "gravelride"].some((item) => type.includes(item));
+}
+
+function activityLoad(activity) {
+  return firstNumber(activity.icu_training_load, activity.training_load, activity.tss);
+}
+
+function activityIntensity(activity) {
+  return normalizeIntensity(firstNumber(activity.icu_intensity, activity.intensity, activity.if));
 }
 
 function getActivityId(activity) {
@@ -554,13 +859,28 @@ function inDateRange(value, oldest, newest) {
   return value >= oldest && value <= newest;
 }
 
-function dateRange(daysBack, daysForward) {
-  const now = new Date();
-  const oldest = new Date(now);
-  oldest.setUTCDate(now.getUTCDate() - daysBack);
-  const newest = new Date(now);
-  newest.setUTCDate(now.getUTCDate() + daysForward);
+function utcDateRangeAround(date, daysBack, daysForward) {
+  const oldest = new Date(date);
+  oldest.setUTCDate(date.getUTCDate() - daysBack);
+  const newest = new Date(date);
+  newest.setUTCDate(date.getUTCDate() + daysForward);
   return { oldest: isoDate(oldest), newest: isoDate(newest) };
+}
+
+function dateRangeFromIso(date, daysBack, daysForward) {
+  const base = new Date(`${date}T00:00:00Z`);
+  return utcDateRangeAround(base, daysBack, daysForward);
+}
+
+function chinaDate(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: CHINA_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function dateParam(url, name) {
+  const value = url.searchParams.get(name);
+  return /^\d{4}-\d{2}-\d{2}$/.test(value || "") ? value : null;
 }
 
 function powerPeaks(activity) {
@@ -589,6 +909,17 @@ function fieldHints(activity) {
     .slice(0, 30)
     .reduce((acc, key) => {
       if (typeof activity[key] !== "object") acc[key] = activity[key];
+      return acc;
+    }, {});
+}
+
+function wellnessHints(wellness) {
+  const hints = ["stress", "readiness", "recovery", "battery", "sleep", "oura", "steps", "calories", "strain", "activity"];
+  return Object.keys(wellness || {})
+    .filter((key) => hints.some((hint) => key.toLowerCase().includes(hint)))
+    .slice(0, 40)
+    .reduce((acc, key) => {
+      if (typeof wellness[key] !== "object") acc[key] = wellness[key];
       return acc;
     }, {});
 }
@@ -778,6 +1109,17 @@ function format(value, digits) {
   return Number(value).toFixed(digits);
 }
 
+function formatSigned(value, digits) {
+  if (value == null || !Number.isFinite(Number(value))) return "暂无";
+  const number = Number(value);
+  return `${number > 0 ? "+" : ""}${number.toFixed(digits)}`;
+}
+
+function formatSignedPercent(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "暂无";
+  return `${formatSigned(value, 1)}%`;
+}
+
 function watts(value) {
   return value == null ? "暂无" : `${format(value, 0)} W`;
 }
@@ -789,11 +1131,17 @@ function hrPair(avgHr, maxHr) {
 
 function formatDuration(value) {
   if (value == null) return "暂无";
-  const total = Math.round(value);
+  const total = Math.max(0, Math.round(value));
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
   if (hours > 0) return `${hours}小时${minutes}分钟`;
   return `${minutes}分钟`;
+}
+
+function formatSignedDuration(value) {
+  if (value == null) return "暂无";
+  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
+  return `${sign}${formatDuration(Math.abs(value))}`;
 }
 
 function escapeHtml(value) {
