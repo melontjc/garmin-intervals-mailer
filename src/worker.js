@@ -307,6 +307,9 @@ function summarizeWellness(wellnessDays, activityDateValue, ouraData = null) {
     temperatureDeviation: firstNumber(oura.temperatureDeviation),
     respiratoryRate: firstNumber(oura.respiratoryRate),
     stress: positiveNumber(oura.stress, current?.stress, current?.stress_score, current?.avg_stress),
+    stressSummary: oura.stressSummary,
+    stressHighSec: firstNumber(oura.stressHighSec),
+    stressRecoverySec: firstNumber(oura.stressRecoverySec),
     bodyBattery: firstNumber(current?.bodyBattery, current?.body_battery, current?.bodyBatteryCharged),
     steps: firstNumber(oura.steps, current?.steps, current?.step_count),
     activeCalories: firstNumber(oura.activeCalories, current?.activeCalories, current?.active_calories),
@@ -334,8 +337,8 @@ function summarizeOuraWellness(ouraData, activityDateValue) {
   const dailyReadiness = matchOuraDay(ouraData.dailyReadiness, activityDateValue);
   const dailyActivity = matchOuraDay(ouraData.dailyActivity, activityDateValue);
   const dailyStress = matchOuraDay(ouraData.dailyStress, activityDateValue);
-  const sleepSession = matchOuraDay(ouraData.sleepSessions, activityDateValue);
-  const recentSleepSessions = recentOuraDays(ouraData.sleepSessions, activityDateValue, 7);
+  const sleepSession = matchOuraMainSleep(ouraData.sleepSessions, activityDateValue);
+  const recentSleepSessions = recentOuraMainSleeps(ouraData.sleepSessions, activityDateValue, 7);
   const recentDailySleep = recentOuraDays(ouraData.dailySleep, activityDateValue, 7);
 
   const sleepDurations = recentSleepSessions
@@ -371,7 +374,10 @@ function summarizeOuraWellness(ouraData, activityDateValue) {
     readinessContributors: dailyReadiness?.contributors || null,
     temperatureDeviation: firstNumber(sleepSession?.temperature_deviation, dailyReadiness?.temperature_deviation),
     respiratoryRate: firstNumber(sleepSession?.average_breath, sleepSession?.respiratory_rate),
-    stress: firstNumber(dailyStress?.stress_high, dailyStress?.stress_medium, dailyStress?.day_summary),
+    stress: positiveNumber(dailyStress?.stress_high),
+    stressSummary: dailyStress?.day_summary || null,
+    stressHighSec: firstNumber(dailyStress?.stress_high),
+    stressRecoverySec: firstNumber(dailyStress?.recovery_high),
     steps: firstNumber(dailyActivity?.steps),
     activeCalories: firstNumber(dailyActivity?.active_calories),
     totalCalories: firstNumber(dailyActivity?.total_calories),
@@ -1112,6 +1118,33 @@ function wellnessHints(wellness) {
 
 function matchOuraDay(items, date) {
   return (Array.isArray(items) ? items : []).find((item) => ouraItemDate(item) === date) || null;
+}
+
+function matchOuraMainSleep(items, date) {
+  return mainSleepByDate(items).get(date) || null;
+}
+
+function recentOuraMainSleeps(items, date, days) {
+  return [...mainSleepByDate(items).entries()]
+    .filter(([itemDate]) => itemDate && itemDate <= date && daysBetween(itemDate, date) <= days)
+    .map(([, item]) => item);
+}
+
+function mainSleepByDate(items) {
+  const grouped = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const date = ouraItemDate(item);
+    if (!date) continue;
+    const existing = grouped.get(date);
+    if (!existing || mainSleepRank(item) > mainSleepRank(existing)) grouped.set(date, item);
+  }
+  return grouped;
+}
+
+function mainSleepRank(item) {
+  const duration = firstNumber(item?.total_sleep_duration, item?.total_sleep_duration_seconds) || 0;
+  const typeBoost = String(item?.type || "").toLowerCase() === "long_sleep" ? 24 * 60 * 60 : 0;
+  return typeBoost + duration;
 }
 
 function recentOuraDays(items, date, days) {
