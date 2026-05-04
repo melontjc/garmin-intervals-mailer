@@ -7,15 +7,15 @@
 - 晨间身体状态分析：北京时间 09:20，分析昨夜睡眠和今晨恢复状态。
 - 晚间身体小报：北京时间 21:00，分析当天活动/运动负荷、压力和恢复趋势。
 
-数据源只使用已经同步至 Intervals.icu 的 Garmin 与 Oura Ring 数据。字段缺失时邮件仍发送，并明确标注“暂无/未同步”，不编造、不补发。
+训练数据继续使用已经同步至 Intervals.icu 的 Garmin 与功率计数据。身体恢复数据优先使用 Oura 官方 API；如果未配置 Oura token 或接口失败，则自动降级使用 Intervals.icu wellness。字段缺失时邮件仍发送，并明确标注“暂无/未同步”，不编造、不补发。
 
 ## 需求表
 
 | 模块 | 时间 | 数据口径 | 输出 | 去重 |
 |---|---:|---|---|---|
 | Ride Analysis | 每 30 分钟 | 最近骑行活动 | 单次骑行训练分析邮件 | `sent:{activityId}` |
-| Morning Body Status | 北京时间 09:20 | 当日 wellness，重点看昨夜睡眠、HRV、静息心率 | 晨间身体状态邮件 | `sent:body:morning:YYYY-MM-DD` |
-| Evening Body Brief | 北京时间 21:00 | 当日 wellness + 当天所有活动 | 晚间身体小报 | `sent:body:evening:YYYY-MM-DD` |
+| Morning Body Status | 北京时间 09:20 | Oura 睡眠/恢复 + ICU wellness 兜底，重点看昨夜睡眠、HRV、静息心率 | 晨间身体状态邮件 | `sent:body:morning:YYYY-MM-DD` |
+| Evening Body Brief | 北京时间 21:00 | Oura 全天活动/恢复 + Intervals.icu 当天所有运动 | 晚间身体小报 | `sent:body:evening:YYYY-MM-DD` |
 
 Cloudflare cron 使用 UTC：
 
@@ -42,7 +42,8 @@ Cloudflare cron 使用 UTC：
 
 - 睡眠时长、7 日均值、睡眠差。
 - HRV、静息心率、相对 7 日趋势。
-- Intervals.icu wellness 中当前可读的 Oura/Garmin 字段：`sleepSecs`、`sleepScore`、`sleepQuality`、`avgSleepingHR`、`readiness`、`steps`、HRV、静息心率。
+- Oura API 优先字段：睡眠评分、总睡眠、睡眠效率、深睡、REM、清醒时间、睡眠均心率、最低睡眠心率、平均 HRV、准备度、体温偏离、呼吸率、步数、活动评分、活动热量、久坐/低中高强度活动时间。
+- Intervals.icu wellness 兜底字段：`sleepSecs`、`sleepScore`、`sleepQuality`、`avgSleepingHR`、`readiness`、`steps`、HRV、静息心率。
 - `stress`、`Body Battery`、`active calories` 等字段如果未同步或为空，邮件中显示“暂无/未同步”。
 - 今日状态：`🟢 可训练`、`🟡 保守推进`、`🟠 优先恢复`。
 - 当日训练强度上限、补水、咖啡因、午休建议。
@@ -57,6 +58,8 @@ Cloudflare cron 使用 UTC：
 AI 逻辑：
 
 - 使用 OpenAI Responses API，默认模型 `gpt-4.1-mini`。
+- AI 不复刻 Oura App 汇报，不只复述睡眠评分；重点做 Oura 恢复信号与 Intervals.icu/Garmin 训练负荷之间的整合判断。
+- AI 输出当天/次日训练安排、恢复优先级和冲突判断，例如 “Oura readiness 尚可，但近期训练负荷偏高，所以保守推进”。
 - AI 只负责将结构化指标转成更自然的中文分析，不编造缺失字段。
 - AI 调用失败时自动使用规则版 fallback，邮件仍发送。
 

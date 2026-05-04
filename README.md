@@ -4,7 +4,8 @@
 
 1. Garmin Connect / Oura Ring 数据同步到 Intervals.icu。
 2. Worker 定时读取 Intervals.icu 的 activities 与 wellness 数据。
-3. 生成骑行分析、晨间身体状态、晚间身体小报。
+3. 如果配置了 Oura API token，Worker 会直接读取 Oura 官方恢复/睡眠/活动数据，并优先用于身体状态分析。
+4. 生成骑行分析、晨间身体状态、晚间身体小报。
 4. 通过 Resend 发到你的邮箱。
 
 详细身体状态需求见 [docs/body-status-analysis.md](docs/body-status-analysis.md)。
@@ -21,6 +22,7 @@
 
 - Intervals.icu 账号，并连接 Garmin Connect / Oura Ring。
 - Intervals.icu API key。
+- Oura Membership 与 Oura Personal Access Token，可选，但建议开启，用于读取更完整的睡眠和恢复数据。
 - Cloudflare 账号。
 - Resend 账号和 API key。
 - OpenAI API key，用于 AI 总结；缺失或失败时会使用规则版 fallback。
@@ -37,6 +39,7 @@ Copy-Item .dev.vars.example .dev.vars
 
 - `INTERVALS_API_KEY`
 - `INTERVALS_ATHLETE_ID`，先用 `0`
+- `OURA_ACCESS_TOKEN`，可选；不填时继续只使用 Intervals.icu wellness
 - `OPENAI_API_KEY`
 - `OPENAI_MODEL`，默认 `gpt-4.1-mini`
 - `RESEND_API_KEY`
@@ -71,6 +74,8 @@ node scripts\local-run.mjs '/run/body/morning?dry=1&force=1&date=2026-05-02'
 node scripts\local-run.mjs '/run/body/evening?dry=1&force=1&date=2026-05-02'
 ```
 
+配置 Oura token 后，dry-run 返回的 `previews[0].analysis.wellness.source` 应显示 `oura-api+intervals`。如果 Oura 接口暂时不可用，会自动降级为 `intervals`，邮件仍然发送。
+
 浏览器云端测试：
 
 ```text
@@ -96,6 +101,7 @@ npx.cmd wrangler kv namespace create SENT_ACTIVITIES
 
 ```powershell
 npx.cmd wrangler secret put INTERVALS_API_KEY
+npx.cmd wrangler secret put OURA_ACCESS_TOKEN
 npx.cmd wrangler secret put OPENAI_API_KEY
 npx.cmd wrangler secret put RESEND_API_KEY
 ```

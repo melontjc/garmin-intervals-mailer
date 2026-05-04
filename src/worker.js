@@ -1,4 +1,5 @@
 const INTERVALS_BASE_URL = "https://intervals.icu/api/v1";
+const OURA_BASE_URL = "https://api.ouraring.com/v2/usercollection";
 const RESEND_URL = "https://api.resend.com/emails";
 const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const CHINA_TIME_ZONE = "Asia/Shanghai";
@@ -51,6 +52,7 @@ function health(env) {
     ai: Boolean(env.OPENAI_API_KEY),
     bindings: {
       intervals: "INTERVALS_API_KEY" in env,
+      oura: "OURA_ACCESS_TOKEN" in env,
       resend: "RESEND_API_KEY" in env,
       openai: "OPENAI_API_KEY" in env,
       openaiModel: env.OPENAI_MODEL || null
@@ -133,7 +135,8 @@ async function runBodyReport(env, kind, options = {}) {
     fetchActivities(env, athleteId, dayRange.oldest, dayRange.newest)
   ]);
 
-  const analysis = buildBodyAnalysis(kind, reportDate, wellnessDays, activities);
+  const ouraData = await fetchOuraDailyData(env, range.oldest, range.newest);
+  const analysis = buildBodyAnalysis(kind, reportDate, wellnessDays, activities, ouraData);
   const fallback = buildRuleBodyReport(analysis);
   const aiReport = await buildAiReport(env, `body-${kind}`, analysis, fallback);
   const report = buildBodyEmailReport(analysis, aiReport);
@@ -172,8 +175,8 @@ function buildRideAnalysis(activity, historyRides, wellnessDays) {
   };
 }
 
-function buildBodyAnalysis(kind, date, wellnessDays, activities) {
-  const wellness = summarizeWellness(wellnessDays, date);
+function buildBodyAnalysis(kind, date, wellnessDays, activities, ouraData = null) {
+  const wellness = summarizeWellness(wellnessDays, date, ouraData);
   const dayActivities = activities.filter((activity) => activityDate(activity) === date);
   const activitySummary = summarizeDailyActivities(dayActivities);
   const status = inferBodyStatus(kind, wellness, activitySummary);
@@ -261,40 +264,129 @@ function summarizeHistory(rides, activityDateValue) {
   };
 }
 
-function summarizeWellness(wellnessDays, activityDateValue) {
+function summarizeWellness(wellnessDays, activityDateValue, ouraData = null) {
   const dated = (Array.isArray(wellnessDays) ? wellnessDays : [])
     .map((item) => ({ ...item, date: localDate(item.id || item.date || item.day || item.start_date || "") }))
     .filter((item) => item.date);
   const current = dated.find((item) => item.date === activityDateValue) || null;
   const last7 = dated.filter((item) => daysBetween(item.date, activityDateValue) <= 7);
-  const hrvToday = positiveNumber(current?.hrv, current?.hrvRMSSD, current?.hrv_rmssd);
-  const restingHrToday = rangeNumber(25, 120, current?.restingHR, current?.resting_hr, current?.restingHeartRate);
-  const sleepSecToday = rangeNumber(60 * 60, 14 * 60 * 60, current?.sleepSecs, current?.sleep_seconds, current?.sleep);
+  const oura = summarizeOuraWellness(ouraData, activityDateValue);
+  const hrvToday = positiveNumber(oura.hrvToday, current?.hrv, current?.hrvRMSSD, current?.hrv_rmssd);
+  const restingHrToday = rangeNumber(25, 120, oura.restingHrToday, current?.restingHR, current?.resting_hr, current?.restingHeartRate);
+  const sleepSecToday = rangeNumber(60 * 60, 14 * 60 * 60, oura.sleepTodaySec, current?.sleepSecs, current?.sleep_seconds, current?.sleep);
   const hrv7 = average(last7.map((item) => positiveNumber(item.hrv, item.hrvRMSSD, item.hrv_rmssd)).filter(isNumber));
   const restingHr7 = average(last7.map((item) => rangeNumber(25, 120, item.restingHR, item.resting_hr, item.restingHeartRate)).filter(isNumber));
   const sleep7 = average(last7.map((item) => rangeNumber(60 * 60, 14 * 60 * 60, item.sleepSecs, item.sleep_seconds, item.sleep)).filter(isNumber));
 
   return {
-    available: Boolean(current || last7.length),
+    available: Boolean(oura.available || current || last7.length),
+    source: oura.available ? "oura-api+intervals" : "intervals",
     date: activityDateValue,
     hrvToday,
-    hrv7dAvg: hrv7,
-    hrvDeltaPct: hrvToday && hrv7 ? ((hrvToday - hrv7) / hrv7) * 100 : null,
+    hrv7dAvg: oura.hrv7dAvg ?? hrv7,
+    hrvDeltaPct: hrvToday && (oura.hrv7dAvg ?? hrv7) ? ((hrvToday - (oura.hrv7dAvg ?? hrv7)) / (oura.hrv7dAvg ?? hrv7)) * 100 : null,
     restingHrToday,
-    restingHr7dAvg: restingHr7,
-    restingHrDelta: restingHrToday && restingHr7 ? restingHrToday - restingHr7 : null,
+    restingHr7dAvg: oura.restingHr7dAvg ?? restingHr7,
+    restingHrDelta: restingHrToday && (oura.restingHr7dAvg ?? restingHr7) ? restingHrToday - (oura.restingHr7dAvg ?? restingHr7) : null,
     sleepTodaySec: sleepSecToday,
-    sleep7dAvgSec: sleep7,
-    sleepDebtSec: sleepSecToday && sleep7 ? sleepSecToday - sleep7 : null,
-    sleepScore: firstNumber(current?.sleepScore, current?.sleep_score, current?.oura_sleep_score),
-    sleepQuality: firstNumber(current?.sleepQuality, current?.sleep_quality),
-    avgSleepingHr: rangeNumber(25, 120, current?.avgSleepingHR, current?.avg_sleeping_hr, current?.average_sleeping_hr),
-    readiness: firstNumber(current?.readiness, current?.readiness_score, current?.oura_readiness),
-    stress: positiveNumber(current?.stress, current?.stress_score, current?.avg_stress),
+    sleep7dAvgSec: oura.sleep7dAvgSec ?? sleep7,
+    sleepDebtSec: sleepSecToday && (oura.sleep7dAvgSec ?? sleep7) ? sleepSecToday - (oura.sleep7dAvgSec ?? sleep7) : null,
+    sleepScore: firstNumber(oura.sleepScore, current?.sleepScore, current?.sleep_score, current?.oura_sleep_score),
+    sleepQuality: firstNumber(oura.sleepQuality, current?.sleepQuality, current?.sleep_quality),
+    sleepEfficiency: firstNumber(oura.sleepEfficiency),
+    remSleepSec: firstNumber(oura.remSleepSec),
+    deepSleepSec: firstNumber(oura.deepSleepSec),
+    awakeSec: firstNumber(oura.awakeSec),
+    sleepLatencySec: firstNumber(oura.sleepLatencySec),
+    bedtimeStart: oura.bedtimeStart,
+    bedtimeEnd: oura.bedtimeEnd,
+    avgSleepingHr: rangeNumber(25, 120, oura.avgSleepingHr, current?.avgSleepingHR, current?.avg_sleeping_hr, current?.average_sleeping_hr),
+    lowestSleepingHr: rangeNumber(25, 120, oura.lowestSleepingHr),
+    readiness: firstNumber(oura.readiness, current?.readiness, current?.readiness_score, current?.oura_readiness),
+    readinessContributors: oura.readinessContributors,
+    temperatureDeviation: firstNumber(oura.temperatureDeviation),
+    respiratoryRate: firstNumber(oura.respiratoryRate),
+    stress: positiveNumber(oura.stress, current?.stress, current?.stress_score, current?.avg_stress),
     bodyBattery: firstNumber(current?.bodyBattery, current?.body_battery, current?.bodyBatteryCharged),
-    steps: firstNumber(current?.steps, current?.step_count),
-    activeCalories: firstNumber(current?.activeCalories, current?.active_calories),
-    rawHints: current ? wellnessHints(current) : {}
+    steps: firstNumber(oura.steps, current?.steps, current?.step_count),
+    activeCalories: firstNumber(oura.activeCalories, current?.activeCalories, current?.active_calories),
+    totalCalories: firstNumber(oura.totalCalories),
+    activityScore: firstNumber(oura.activityScore),
+    sedentaryTimeSec: firstNumber(oura.sedentaryTimeSec),
+    lowActivityTimeSec: firstNumber(oura.lowActivityTimeSec),
+    mediumActivityTimeSec: firstNumber(oura.mediumActivityTimeSec),
+    highActivityTimeSec: firstNumber(oura.highActivityTimeSec),
+    dataSources: {
+      oura: oura.available,
+      intervals: Boolean(current || last7.length)
+    },
+    rawHints: {
+      intervals: current ? wellnessHints(current) : {},
+      oura: oura.rawHints || {}
+    },
+    ouraErrors: ouraData?.errors || []
+  };
+}
+
+function summarizeOuraWellness(ouraData, activityDateValue) {
+  if (!ouraData?.enabled) return { available: false };
+  const dailySleep = matchOuraDay(ouraData.dailySleep, activityDateValue);
+  const dailyReadiness = matchOuraDay(ouraData.dailyReadiness, activityDateValue);
+  const dailyActivity = matchOuraDay(ouraData.dailyActivity, activityDateValue);
+  const dailyStress = matchOuraDay(ouraData.dailyStress, activityDateValue);
+  const sleepSession = matchOuraDay(ouraData.sleepSessions, activityDateValue);
+  const recentSleepSessions = recentOuraDays(ouraData.sleepSessions, activityDateValue, 7);
+  const recentDailySleep = recentOuraDays(ouraData.dailySleep, activityDateValue, 7);
+
+  const sleepDurations = recentSleepSessions
+    .map((item) => rangeNumber(60 * 60, 14 * 60 * 60, item.total_sleep_duration, item.total_sleep_duration_seconds))
+    .filter(isNumber);
+  const hrvValues = recentSleepSessions
+    .map((item) => positiveNumber(item.average_hrv, item.avg_hrv, item.hrv))
+    .filter(isNumber);
+  const restingHrValues = recentSleepSessions
+    .map((item) => rangeNumber(25, 120, item.lowest_heart_rate, item.average_heart_rate))
+    .filter(isNumber);
+
+  return {
+    available: Boolean(dailySleep || dailyReadiness || dailyActivity || dailyStress || sleepSession),
+    sleepTodaySec: rangeNumber(60 * 60, 14 * 60 * 60, sleepSession?.total_sleep_duration, sleepSession?.total_sleep_duration_seconds),
+    sleep7dAvgSec: average(sleepDurations),
+    sleepScore: firstNumber(dailySleep?.score, sleepSession?.score),
+    sleepQuality: firstNumber(dailySleep?.score, sleepSession?.score),
+    sleepEfficiency: firstNumber(sleepSession?.efficiency),
+    remSleepSec: firstNumber(sleepSession?.rem_sleep_duration),
+    deepSleepSec: firstNumber(sleepSession?.deep_sleep_duration),
+    awakeSec: firstNumber(sleepSession?.awake_time),
+    sleepLatencySec: firstNumber(sleepSession?.latency),
+    bedtimeStart: sleepSession?.bedtime_start || null,
+    bedtimeEnd: sleepSession?.bedtime_end || null,
+    hrvToday: positiveNumber(sleepSession?.average_hrv, sleepSession?.avg_hrv, sleepSession?.hrv),
+    hrv7dAvg: average(hrvValues),
+    restingHrToday: rangeNumber(25, 120, sleepSession?.lowest_heart_rate, sleepSession?.average_heart_rate),
+    restingHr7dAvg: average(restingHrValues),
+    avgSleepingHr: rangeNumber(25, 120, sleepSession?.average_heart_rate),
+    lowestSleepingHr: rangeNumber(25, 120, sleepSession?.lowest_heart_rate),
+    readiness: firstNumber(dailyReadiness?.score),
+    readinessContributors: dailyReadiness?.contributors || null,
+    temperatureDeviation: firstNumber(sleepSession?.temperature_deviation, dailyReadiness?.temperature_deviation),
+    respiratoryRate: firstNumber(sleepSession?.average_breath, sleepSession?.respiratory_rate),
+    stress: firstNumber(dailyStress?.stress_high, dailyStress?.stress_medium, dailyStress?.day_summary),
+    steps: firstNumber(dailyActivity?.steps),
+    activeCalories: firstNumber(dailyActivity?.active_calories),
+    totalCalories: firstNumber(dailyActivity?.total_calories),
+    activityScore: firstNumber(dailyActivity?.score),
+    sedentaryTimeSec: firstNumber(dailyActivity?.sedentary_time),
+    lowActivityTimeSec: firstNumber(dailyActivity?.low_activity_time),
+    mediumActivityTimeSec: firstNumber(dailyActivity?.medium_activity_time),
+    highActivityTimeSec: firstNumber(dailyActivity?.high_activity_time),
+    rawHints: {
+      dailySleep: compactObject(dailySleep, ["id", "day", "score", "contributors"]),
+      dailyReadiness: compactObject(dailyReadiness, ["id", "day", "score", "contributors"]),
+      dailyActivity: compactObject(dailyActivity, ["id", "day", "score", "steps", "active_calories", "total_calories", "sedentary_time"]),
+      dailyStress: compactObject(dailyStress, ["id", "day", "stress_high", "stress_medium", "recovery_high", "day_summary"]),
+      sleep: compactObject(sleepSession, ["id", "day", "score", "total_sleep_duration", "efficiency", "average_heart_rate", "lowest_heart_rate", "average_hrv", "temperature_deviation", "average_breath"])
+    }
   };
 }
 
@@ -532,8 +624,9 @@ function aiPrompt(kind, analysis) {
     return {
       instructions: "你是一名严谨但表达有活力的身体状态分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，像私人健康教练，专业、轻快、具体，但不过度医疗化。",
       text: [
-        "请写一封晨间身体状态分析邮件正文。邮件前面已有图标化摘要，所以正文不要重复堆指标，要解释这些指标对今天安排的含义。",
-        "要求：1. 一句总评；2. 睡眠/HRV/静息心率解读；3. 今日训练强度上限；4. 补水、咖啡因、午休建议；5. 缺失字段要明确说明；6. 不要说自己是 AI。",
+        "请写一封晨间身体状态分析邮件正文。邮件前面已有图标化摘要，所以正文不要重复堆指标，要把 Oura 恢复数据和 Intervals.icu/Garmin 训练负荷整合成今天的行动建议。",
+        "定位：不要复刻 Oura App，也不要只复述睡眠评分；你的价值是判断今天该怎么练、怎么恢复，以及恢复信号和近期训练负荷是否冲突。",
+        "要求：1. 一句总评；2. 解释 Oura 睡眠/HRV/静息心率/准备度对今天的含义；3. 结合当天/近期训练负荷给出今日训练强度上限；4. 补水、咖啡因、午休建议；5. 缺失字段要明确说明；6. 不要说自己是 AI。",
         "",
         JSON.stringify(analysis, null, 2)
       ].join("\n")
@@ -544,7 +637,8 @@ function aiPrompt(kind, analysis) {
       instructions: "你是一名严谨但表达有活力的晚间身体状态分析师。只基于用户提供的 JSON 数据分析，不要编造缺失指标。输出中文，像私人健康教练，专业、轻快、具体，但不过度医疗化。",
       text: [
         "请写一封晚间身体小报正文。邮件前面已有图标化摘要，所以正文要把今天身体承受了什么、今晚怎么睡、明天怎么安排讲清楚。",
-        "要求：1. 一句总评；2. 当天活动/运动负荷解读，如果 activity.count 为 0，要按日常活动与恢复日分析，不要写成空白或异常；3. 压力和恢复趋势；4. 睡前建议；5. 明天训练建议；6. 缺失字段要明确说明；7. 不要说自己是 AI。",
+        "定位：不要复刻 Oura App；你的价值是把 Oura 的全天恢复/活动信号与 Intervals.icu/Garmin 的运动负荷放在一起，形成明天的训练和恢复决策。",
+        "要求：1. 一句总评；2. 当天活动/运动负荷解读，如果 activity.count 为 0，要按日常活动与恢复日分析，不要写成空白或异常；3. 说明 Oura 恢复信号和训练负荷是否一致，若冲突要给出保守建议；4. 睡前建议；5. 明天训练建议；6. 缺失字段要明确说明；7. 不要说自己是 AI。",
         "",
         JSON.stringify(analysis, null, 2)
       ].join("\n")
@@ -671,6 +765,8 @@ function buildBodySummary(analysis) {
       `7日均值 ${formatDuration(wellness.sleep7dAvgSec)}`,
       `睡眠差 ${formatSignedDuration(wellness.sleepDebtSec)}`,
       `睡眠评分 ${format(wellness.sleepScore, 0)}`,
+      `睡眠效率 ${format(wellness.sleepEfficiency, 0)}%`,
+      `深睡 ${formatDuration(wellness.deepSleepSec)}｜REM ${formatDuration(wellness.remSleepSec)}`,
       `睡眠均心率 ${format(wellness.avgSleepingHr, 0)} bpm`
     ]],
     ["💚 HRV 与心率", [
@@ -678,12 +774,14 @@ function buildBodySummary(analysis) {
       `HRV 7日均值 ${format(wellness.hrv7dAvg, 0)} ms`,
       `HRV 变化 ${formatSignedPercent(wellness.hrvDeltaPct)}`,
       `静息心率 ${format(wellness.restingHrToday, 0)} bpm`,
-      `静息心率变化 ${formatSigned(wellness.restingHrDelta, 1)} bpm`
+      `静息心率变化 ${formatSigned(wellness.restingHrDelta, 1)} bpm`,
+      `体温偏离 ${formatSigned(wellness.temperatureDeviation, 2)} ℃`
     ]],
     [activityTitle, [
       ...activityLines
     ]],
     ["🔎 数据提示", [
+      `恢复数据源 ${wellness.dataSources?.oura ? "Oura API 优先" : "Intervals.icu wellness"}`,
       dataQuality.note,
       wellness.stress == null ? "压力指标未同步" : `压力指标 ${format(wellness.stress, 0)}`,
       wellness.bodyBattery == null ? "Body Battery/恢复电量未同步" : `Body Battery/恢复电量 ${format(wellness.bodyBattery, 0)}`
@@ -734,13 +832,20 @@ function buildBodyEmailReport(analysis, aiReport) {
     ["睡眠", formatDuration(wellness.sleepTodaySec)],
     ["睡眠评分", format(wellness.sleepScore, 0)],
     ["睡眠 7 日均值", formatDuration(wellness.sleep7dAvgSec)],
+    ["睡眠效率", wellness.sleepEfficiency == null ? "暂无/未同步" : `${format(wellness.sleepEfficiency, 0)}%`],
+    ["深睡 / REM", `${formatDuration(wellness.deepSleepSec)} / ${formatDuration(wellness.remSleepSec)}`],
     ["睡眠均心率", wellness.avgSleepingHr == null ? "暂无/未同步" : `${format(wellness.avgSleepingHr, 0)} bpm`],
+    ["最低睡眠心率", wellness.lowestSleepingHr == null ? "暂无/未同步" : `${format(wellness.lowestSleepingHr, 0)} bpm`],
     ["HRV 今日/7日均值", `${format(wellness.hrvToday, 0)} / ${format(wellness.hrv7dAvg, 0)} ms`],
     ["静息心率 今日/7日均值", `${format(wellness.restingHrToday, 0)} / ${format(wellness.restingHr7dAvg, 0)} bpm`],
     ["Oura 准备度", wellness.readiness == null ? "暂无/未同步" : format(wellness.readiness, 0)],
+    ["体温偏离", wellness.temperatureDeviation == null ? "暂无/未同步" : `${formatSigned(wellness.temperatureDeviation, 2)} ℃`],
+    ["呼吸率", wellness.respiratoryRate == null ? "暂无/未同步" : `${format(wellness.respiratoryRate, 1)} /min`],
     ["步数", wellness.steps == null ? "暂无/未同步" : `${format(wellness.steps, 0)} 步`],
+    ["活动评分", wellness.activityScore == null ? "暂无/未同步" : format(wellness.activityScore, 0)],
     ["压力指标", wellness.stress == null ? "暂无/未同步" : format(wellness.stress, 0)],
     ["Body Battery/恢复电量", wellness.bodyBattery == null ? "暂无/未同步" : format(wellness.bodyBattery, 0)],
+    ["恢复数据源", wellness.dataSources?.oura ? "Oura API + ICU" : "ICU wellness"],
     ["训练记录", activity.count ? `${format(activity.count, 0)} 项` : "无训练记录"],
     ["当天总负荷", format(activity.totalLoad, 0)],
     ["当天运动时长", formatDuration(activity.totalDurationSec)],
@@ -768,7 +873,7 @@ function buildEmailShell({ subject, title, subtitle, summary, metrics, bodyMarkd
         ${metrics.map(([label, value]) => metricCard(label, value)).join("")}
       </div>
       ${markdownToHtml(bodyMarkdown)}
-      <p style="margin-top:24px;color:#7f8c8d;font-size:12px">数据来自 Garmin/Oura via Intervals.icu；AI 只基于结构化指标生成建议，缺失字段不会被推测。</p>
+      <p style="margin-top:24px;color:#7f8c8d;font-size:12px">数据来自 Intervals.icu/Garmin 与 Oura API；AI 只基于结构化指标生成决策建议，缺失字段不会被推测。</p>
     </main>`;
   const text = [title, "", stripHtml(subtitle), "", summary.text, "", "关键指标：", ...metrics.map(([label, value]) => `- ${label}: ${stripHtml(value)}`), "", stripMarkdown(bodyMarkdown)].join("\n");
 
@@ -829,6 +934,47 @@ async function fetchWellnessRange(env, athleteId, oldest, newest) {
   const data = await safeIntervalsFetch(env, `/athlete/${athleteId}/wellness?oldest=${oldest}&newest=${newest}`);
   if (Array.isArray(data)) return data;
   return data ? [data] : [];
+}
+
+async function fetchOuraDailyData(env, oldest, newest) {
+  if (!env.OURA_ACCESS_TOKEN) {
+    return { enabled: false, errors: [] };
+  }
+
+  const endpoints = [
+    ["dailySleep", `/daily_sleep?start_date=${oldest}&end_date=${newest}`],
+    ["dailyReadiness", `/daily_readiness?start_date=${oldest}&end_date=${newest}`],
+    ["dailyActivity", `/daily_activity?start_date=${oldest}&end_date=${newest}`],
+    ["dailyStress", `/daily_stress?start_date=${oldest}&end_date=${newest}`],
+    ["sleepSessions", `/sleep?start_date=${oldest}&end_date=${newest}`]
+  ];
+
+  const result = { enabled: true, errors: [] };
+  await Promise.all(endpoints.map(async ([key, path]) => {
+    try {
+      const data = await ouraFetch(env, path);
+      result[key] = Array.isArray(data?.data) ? data.data : [];
+    } catch (error) {
+      result[key] = [];
+      result.errors.push({ endpoint: key, message: error.message });
+    }
+  }));
+
+  return result;
+}
+
+async function ouraFetch(env, path) {
+  const res = await fetch(`${OURA_BASE_URL}${path}`, {
+    headers: {
+      Authorization: `Bearer ${env.OURA_ACCESS_TOKEN}`,
+      Accept: "application/json"
+    }
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Oura ${res.status}: ${body.slice(0, 220)}`);
+  }
+  return res.json();
 }
 
 async function sendEmail(env, subject, html, text) {
@@ -962,6 +1108,29 @@ function wellnessHints(wellness) {
       if (typeof wellness[key] !== "object") acc[key] = wellness[key];
       return acc;
     }, {});
+}
+
+function matchOuraDay(items, date) {
+  return (Array.isArray(items) ? items : []).find((item) => ouraItemDate(item) === date) || null;
+}
+
+function recentOuraDays(items, date, days) {
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    const itemDate = ouraItemDate(item);
+    return itemDate && itemDate <= date && daysBetween(itemDate, date) <= days;
+  });
+}
+
+function ouraItemDate(item) {
+  return localDate(item?.day || item?.date || item?.bedtime_end || item?.timestamp || item?.id || "");
+}
+
+function compactObject(object, allowedKeys) {
+  if (!object) return null;
+  return allowedKeys.reduce((acc, key) => {
+    if (object[key] !== undefined) acc[key] = object[key];
+    return acc;
+  }, {});
 }
 
 function findByKeyHint(object, hints) {
