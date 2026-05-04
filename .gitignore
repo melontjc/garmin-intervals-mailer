@@ -1,0 +1,8 @@
+.dev.vars
+.dev.vars.local
+.dev.vars.production
+.env
+.env.*
+node_modules
+.wrangler
+*.log

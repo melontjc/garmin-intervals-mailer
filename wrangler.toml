@@ -1,0 +1,19 @@
+name = "garmin-intervals-mailer"
+main = "src/worker.js"
+compatibility_date = "2026-05-03"
+
+[secrets]
+required = ["INTERVALS_API_KEY", "RESEND_API_KEY", "OPENAI_API_KEY"]
+
+[triggers]
+crons = ["*/30 * * * *"]
+
+[[kv_namespaces]]
+binding = "SENT_ACTIVITIES"
+id = "a13f7bbed7fa48eeba10da7129186138"
+
+[vars]
+INTERVALS_ATHLETE_ID = "0"
+OPENAI_MODEL = "gpt-4.1-mini"
+RECIPIENT_EMAIL = "tanjiachen1127@gmail.com"
+RESEND_FROM = "Ride Analysis <onboarding@resend.dev>"

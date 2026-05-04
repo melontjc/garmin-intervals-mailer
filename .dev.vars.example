@@ -1,0 +1,7 @@
+INTERVALS_API_KEY="replace-with-your-intervals-api-key"
+INTERVALS_ATHLETE_ID="0"
+OPENAI_API_KEY="sk-replace-with-your-openai-api-key"
+OPENAI_MODEL="gpt-4.1-mini"
+RESEND_API_KEY="re_replace-with-your-resend-api-key"
+RECIPIENT_EMAIL="your-email@example.com"
+RESEND_FROM="Ride Analysis <onboarding@resend.dev>"
