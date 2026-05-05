@@ -46,7 +46,8 @@ Cloudflare cron 使用 UTC：
 - HRV、静息心率、相对 7 日趋势。
 - Oura API 优先字段：睡眠评分、总睡眠、睡眠效率、深睡、REM、清醒时间、睡眠均心率、最低睡眠心率、平均 HRV、准备度、体温偏离、呼吸率、步数、活动评分、活动热量、久坐/低中高强度活动时间。
 - Intervals.icu wellness 兜底字段：`sleepSecs`、`sleepScore`、`sleepQuality`、`avgSleepingHR`、`readiness`、`steps`、HRV、静息心率。
-- `stress`、`Body Battery`、`active calories` 等字段如果未同步或为空，邮件中显示“暂无/未同步”。
+- Oura 压力字段按时长展示：高压力时长、恢复时长、当日摘要；`stress_high = 0` 代表有效的“无高压力时段”，不视为缺失。
+- `Body Battery` 是 Garmin 生态字段，不作为 Oura 身体状态报告的关键缺失项展示。
 - 今日状态：`🟢 可训练`、`🟡 保守推进`、`🟠 优先恢复`。
 - 当日训练强度上限、补水、咖啡因、午休建议。
 

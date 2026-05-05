@@ -371,7 +371,7 @@ function summarizeWellness(wellnessDays, activityDateValue, ouraData = null) {
     readinessContributors: oura.readinessContributors,
     temperatureDeviation: firstNumber(oura.temperatureDeviation),
     respiratoryRate: firstNumber(oura.respiratoryRate),
-    stress: positiveNumber(oura.stress, current?.stress, current?.stress_score, current?.avg_stress),
+    stress: firstNumber(oura.stress, current?.stress, current?.stress_score, current?.avg_stress),
     stressSummary: oura.stressSummary,
     stressHighSec: firstNumber(oura.stressHighSec),
     stressRecoverySec: firstNumber(oura.stressRecoverySec),
@@ -439,7 +439,7 @@ function summarizeOuraWellness(ouraData, activityDateValue) {
     readinessContributors: dailyReadiness?.contributors || null,
     temperatureDeviation: firstNumber(sleepSession?.temperature_deviation, dailyReadiness?.temperature_deviation),
     respiratoryRate: firstNumber(sleepSession?.average_breath, sleepSession?.respiratory_rate),
-    stress: positiveNumber(dailyStress?.stress_high),
+    stress: firstNumber(dailyStress?.stress_high),
     stressSummary: dailyStress?.day_summary || null,
     stressHighSec: firstNumber(dailyStress?.stress_high),
     stressRecoverySec: firstNumber(dailyStress?.recovery_high),
@@ -651,7 +651,7 @@ function inferBodyDataQuality(wellness, activity) {
   if (wellness.sleepScore == null) missing.push("睡眠评分");
   if (wellness.hrvToday == null) missing.push("HRV");
   if (wellness.restingHrToday == null) missing.push("静息心率");
-  if (wellness.stress == null) missing.push("压力");
+  if (wellness.stress == null && wellness.stressSummary == null && wellness.stressHighSec == null && wellness.stressRecoverySec == null) missing.push("压力");
 
   return {
     completeness: missing.length <= 1 ? "good" : missing.length <= 3 ? "partial" : "poor",
@@ -854,8 +854,7 @@ function buildBodySummary(analysis) {
     ["🔎 数据提示", [
       `恢复数据源 ${wellness.dataSources?.oura ? "Oura API 优先" : "Intervals.icu wellness"}`,
       dataQuality.note,
-      wellness.stress == null ? "压力指标未同步" : `压力指标 ${format(wellness.stress, 0)}`,
-      wellness.bodyBattery == null ? "Body Battery/恢复电量未同步" : `Body Battery/恢复电量 ${format(wellness.bodyBattery, 0)}`
+      stressLine(wellness)
     ]]
   ]);
 }
@@ -914,8 +913,7 @@ function buildBodyEmailReport(analysis, aiReport) {
     ["呼吸率", wellness.respiratoryRate == null ? "暂无/未同步" : `${format(wellness.respiratoryRate, 1)} /min`],
     ["步数", wellness.steps == null ? "暂无/未同步" : `${format(wellness.steps, 0)} 步`],
     ["活动评分", wellness.activityScore == null ? "暂无/未同步" : format(wellness.activityScore, 0)],
-    ["压力指标", wellness.stress == null ? "暂无/未同步" : format(wellness.stress, 0)],
-    ["Body Battery/恢复电量", wellness.bodyBattery == null ? "暂无/未同步" : format(wellness.bodyBattery, 0)],
+    ["压力指标", stressMetric(wellness)],
     ["恢复数据源", wellness.dataSources?.oura ? "Oura API + ICU" : "ICU wellness"],
     ["训练记录", activity.count ? `${format(activity.count, 0)} 项` : "无训练记录"],
     ["当天总负荷", format(activity.totalLoad, 0)],
@@ -957,6 +955,22 @@ function metricCard(label, value) {
       <div style="color:#566573;font-size:12px;line-height:1.25;margin-bottom:3px">${escapeHtml(label)}</div>
       <div style="font-weight:700;font-size:15px;line-height:1.35;word-break:break-word">${value}</div>
     </div>`;
+}
+
+function stressLine(wellness) {
+  if (wellness.stressHighSec == null && wellness.stressRecoverySec == null && wellness.stressSummary == null) {
+    return "压力指标未同步";
+  }
+  return `Oura 压力 ${stressMetric(wellness)}`;
+}
+
+function stressMetric(wellness) {
+  const parts = [];
+  if (wellness.stressHighSec != null) parts.push(`高压力 ${formatDuration(wellness.stressHighSec)}`);
+  if (wellness.stressRecoverySec != null) parts.push(`恢复 ${formatDuration(wellness.stressRecoverySec)}`);
+  if (wellness.stressSummary) parts.push(`摘要 ${wellness.stressSummary}`);
+  if (!parts.length && wellness.stress != null) parts.push(format(wellness.stress, 0));
+  return parts.length ? parts.join("｜") : "暂无/未同步";
 }
 
 function summaryBlock(title, sections) {
