@@ -142,7 +142,7 @@ async function runMorningWakeReport(env, options = {}) {
   const ouraData = await fetchOuraDailyData(env, ouraRange.oldest, ouraRange.newest);
   const wakeWellness = summarizeOuraWellness(ouraData, reportDate);
   const wakeTime = parseDateTime(wakeWellness.bedtimeEnd);
-  const sendAfter = wakeTime ? new Date(wakeTime.getTime() + 30 * 60 * 1000) : null;
+  const sendAfter = wakeTime ? new Date(wakeTime.getTime() + 15 * 60 * 1000) : null;
   const readyToSend = Boolean(sendAfter && now >= sendAfter);
 
   if (!readyToSend && !options.force) {

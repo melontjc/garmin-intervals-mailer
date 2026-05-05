@@ -4,7 +4,7 @@
 
 在现有 Cloudflare Worker 中新增 **Body Status Analysis** 功能模块，与现有 **Ride Analysis** 并列运行。骑行分析继续每 30 分钟检查新骑行并发送邮件；身体状态模块每天发送两封邮件：
 
-- 晨间身体状态分析：北京时间 08:00-10:00 根据 Oura 主睡眠结束时间触发，起床后约 30 分钟发送；10:00 兜底。
+- 晨间身体状态分析：北京时间 08:00-10:00 根据 Oura 主睡眠结束时间触发，起床后约 15 分钟发送；10:00 兜底。
 - 晚间身体小报：北京时间 23:00，分析当天活动/运动负荷、压力和恢复趋势。
 
 训练数据继续使用已经同步至 Intervals.icu 的 Garmin 与功率计数据。身体恢复数据优先使用 Oura 官方 API；如果未配置 Oura token 或接口失败，则自动降级使用 Intervals.icu wellness。字段缺失时邮件仍发送，并明确标注“暂无/未同步”，不编造、不补发。
@@ -14,7 +14,7 @@
 | 模块 | 时间 | 数据口径 | 输出 | 去重 |
 |---|---:|---|---|---|
 | Ride Analysis | 每 30 分钟 | 最近骑行活动 | 单次骑行训练分析邮件 | `sent:{activityId}` |
-| Morning Body Status | 北京时间 08:00-10:00 | Oura 主睡眠结束 + 30 分钟触发；10:00 兜底 | 晨间身体状态邮件 | `sent:body:morning:YYYY-MM-DD` |
+| Morning Body Status | 北京时间 08:00-10:00 | Oura 主睡眠结束 + 15 分钟触发；10:00 兜底 | 晨间身体状态邮件 | `sent:body:morning:YYYY-MM-DD` |
 | Evening Body Brief | 北京时间 23:00 | Oura 全天活动/恢复 + Intervals.icu 当天所有运动 | 晚间身体小报 | `sent:body:evening:YYYY-MM-DD` |
 
 Cloudflare cron 使用 UTC：
