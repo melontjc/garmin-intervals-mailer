@@ -4,7 +4,7 @@
 
 在现有 Cloudflare Worker 中新增 **Body Status Analysis** 功能模块，与现有 **Ride Analysis** 并列运行。骑行分析继续每 30 分钟检查新骑行并发送邮件；身体状态模块每天发送两封邮件：
 
-- 晨间身体状态分析：北京时间 08:00-10:00 根据 Oura 主睡眠结束时间触发，起床后约 15 分钟发送；10:00 兜底。
+- 晨间身体状态分析：工作日北京时间 09:20 发送，休息日北京时间 10:00 发送；按中国节假日和调休日判断工作日/休息日。
 - 晚间身体小报：北京时间 23:00，分析当天活动/运动负荷、压力和恢复趋势。
 
 训练数据继续使用已经同步至 Intervals.icu 的 Garmin 与功率计数据。身体恢复数据优先使用 Oura 官方 API；如果未配置 Oura token 或接口失败，则自动降级使用 Intervals.icu wellness。字段缺失时邮件仍发送，并明确标注“暂无/未同步”，不编造、不补发。
@@ -14,14 +14,14 @@
 | 模块 | 时间 | 数据口径 | 输出 | 去重 |
 |---|---:|---|---|---|
 | Ride Analysis | 每 30 分钟 | 最近骑行活动 | 单次骑行训练分析邮件 | `sent:{activityId}` |
-| Morning Body Status | 北京时间 08:00-10:00 | Oura 主睡眠结束 + 15 分钟触发；10:00 兜底 | 晨间身体状态邮件 | `sent:body:morning:YYYY-MM-DD` |
+| Morning Body Status | 工作日 09:20 / 休息日 10:00 | 中国节假日与调休日历 + Oura 睡眠/恢复 | 晨间身体状态邮件 | `sent:body:morning:YYYY-MM-DD` |
 | Evening Body Brief | 北京时间 23:00 | Oura 全天活动/恢复 + Intervals.icu 当天所有运动 | 晚间身体小报 | `sent:body:evening:YYYY-MM-DD` |
 
 Cloudflare cron 使用 UTC：
 
 - `*/30 * * * *`：骑行分析
-- `*/15 0-1 * * *`：北京时间 08:00-09:45 晨报醒来检测
-- `0 2 * * *`：北京时间 10:00 晨报兜底
+- `20 1 * * *`：北京时间 09:20 工作日晨报
+- `0 2 * * *`：北京时间 10:00 休息日晨报
 - `0 15 * * *`：北京时间 23:00 晚报
 
 ## 手动测试接口
@@ -29,7 +29,7 @@ Cloudflare cron 使用 UTC：
 - `/run`：兼容旧入口，触发骑行分析。
 - `/run/ride?dry=1&force=1&max=1`：骑行分析测试。
 - `/run/body/morning?dry=1&force=1&date=YYYY-MM-DD`：晨报测试。
-- `/run/body/morning/wake?dry=1&date=YYYY-MM-DD&now=YYYY-MM-DDTHH:mm:ss%2B08:00`：晨报醒来检测测试。
+- `/run/body/morning/calendar?dry=1&date=YYYY-MM-DD&slot=workday|restday`：晨报工作日历测试。
 - `/run/body/evening?dry=1&force=1&date=YYYY-MM-DD`：晚报测试。
 
 参数说明：
@@ -80,6 +80,20 @@ AI 逻辑：
 - 不带 `force=1` 重复触发同一天晨报/晚报时跳过。
 - 带 `force=1` 可以重发测试邮件。
 - `.dev.vars`、日志和 `node_modules` 不进入 Git。
+
+## 中国工作日历
+
+2026 年节假日与补班日按国务院办公厅官方安排内置：
+
+- 元旦：1 月 1 日至 3 日放假，1 月 4 日补班。
+- 春节：2 月 15 日至 23 日放假，2 月 14 日、2 月 28 日补班。
+- 清明节：4 月 4 日至 6 日放假。
+- 劳动节：5 月 1 日至 5 日放假，5 月 9 日补班。
+- 端午节：6 月 19 日至 21 日放假。
+- 中秋节：9 月 25 日至 27 日放假。
+- 国庆节：10 月 1 日至 7 日放假，9 月 20 日、10 月 10 日补班。
+
+未维护年份会自动退回普通规则：周一至周五为工作日，周六周日为休息日。
 
 ## 排期
 

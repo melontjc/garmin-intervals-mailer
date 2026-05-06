@@ -5,9 +5,23 @@ const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
 const CHINA_TIME_ZONE = "Asia/Shanghai";
 
 const CRON_RIDE = "*/30 * * * *";
-const CRON_BODY_MORNING_WAKE = "*/15 0-1 * * *";
-const CRON_BODY_MORNING_FALLBACK = "0 2 * * *";
+const CRON_BODY_MORNING_WORKDAY = "20 1 * * *";
+const CRON_BODY_MORNING_RESTDAY = "0 2 * * *";
 const CRON_BODY_EVENING = "0 15 * * *";
+
+const CHINA_2026_HOLIDAYS = new Set([
+  "2026-01-01", "2026-01-02", "2026-01-03",
+  "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+  "2026-04-04", "2026-04-05", "2026-04-06",
+  "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+  "2026-06-19", "2026-06-20", "2026-06-21",
+  "2026-09-25", "2026-09-26", "2026-09-27",
+  "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07"
+]);
+
+const CHINA_2026_WORKDAYS = new Set([
+  "2026-01-04", "2026-02-14", "2026-02-28", "2026-05-09", "2026-09-20", "2026-10-10"
+]);
 
 export default {
   async fetch(request, env) {
@@ -22,8 +36,12 @@ export default {
       return json(await runBodyReport(env, "morning", bodyOptions(url)));
     }
 
+    if (url.pathname === "/run/body/morning/calendar") {
+      return json(await runMorningCalendarReport(env, bodyOptions(url)));
+    }
+
     if (url.pathname === "/run/body/morning/wake") {
-      return json(await runMorningWakeReport(env, bodyOptions(url)));
+      return json(await runMorningCalendarReport(env, bodyOptions(url)));
     }
 
     if (url.pathname === "/run/body/evening") {
@@ -34,12 +52,12 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    if (controller.cron === CRON_BODY_MORNING_WAKE) {
-      ctx.waitUntil(runMorningWakeReport(env, { force: false, dryRun: false }));
+    if (controller.cron === CRON_BODY_MORNING_WORKDAY) {
+      ctx.waitUntil(runMorningCalendarReport(env, { force: false, dryRun: false, slot: "workday" }));
       return;
     }
-    if (controller.cron === CRON_BODY_MORNING_FALLBACK) {
-      ctx.waitUntil(runBodyReport(env, "morning", { force: false, dryRun: false }));
+    if (controller.cron === CRON_BODY_MORNING_RESTDAY) {
+      ctx.waitUntil(runMorningCalendarReport(env, { force: false, dryRun: false, slot: "restday" }));
       return;
     }
     if (controller.cron === CRON_BODY_EVENING) {
@@ -68,10 +86,11 @@ function health(env) {
     },
     schedules: {
       ride: CRON_RIDE,
-      bodyMorningWakeCheck: CRON_BODY_MORNING_WAKE,
-      bodyMorningFallback: CRON_BODY_MORNING_FALLBACK,
+      bodyMorningWorkday: CRON_BODY_MORNING_WORKDAY,
+      bodyMorningRestday: CRON_BODY_MORNING_RESTDAY,
       bodyEvening: CRON_BODY_EVENING,
-      timeZone: CHINA_TIME_ZONE
+      timeZone: CHINA_TIME_ZONE,
+      chinaHolidayCalendar: "2026 State Council holiday/workday overrides"
     }
   });
 }
@@ -126,36 +145,32 @@ async function runRideAnalysis(env, options = {}) {
   return { ok: true, module: "ride", sent, skipped, previews, checked: processable.length, aiEnabled: Boolean(env.OPENAI_API_KEY) };
 }
 
-async function runMorningWakeReport(env, options = {}) {
+async function runMorningCalendarReport(env, options = {}) {
   requireEnv(env, ["INTERVALS_API_KEY", "RESEND_API_KEY", "RECIPIENT_EMAIL", "RESEND_FROM"]);
 
   const now = parseDateTime(options.now) || new Date();
   const reportDate = options.date || chinaDate(now);
+  const dayType = chinaDayType(reportDate);
+  const expectedSlot = options.slot || options.expected || null;
   const kvKey = `sent:body:morning:${reportDate}`;
   const alreadySent = await env.SENT_ACTIVITIES.get(kvKey);
 
   if (alreadySent && !options.force) {
-    return { ok: true, module: "body", kind: "morning-wake", date: reportDate, sent: [], skipped: [{ reason: "already-sent", key: kvKey }], previews: [], aiEnabled: Boolean(env.OPENAI_API_KEY) };
+    return { ok: true, module: "body", kind: "morning-calendar", date: reportDate, dayType, sent: [], skipped: [{ reason: "already-sent", key: kvKey }], previews: [], aiEnabled: Boolean(env.OPENAI_API_KEY) };
   }
 
-  const ouraRange = dateRangeFromIso(reportDate, 1, 1);
-  const ouraData = await fetchOuraDailyData(env, ouraRange.oldest, ouraRange.newest);
-  const wakeWellness = summarizeOuraWellness(ouraData, reportDate);
-  const wakeTime = parseDateTime(wakeWellness.bedtimeEnd);
-  const sendAfter = wakeTime ? new Date(wakeTime.getTime() + 15 * 60 * 1000) : null;
-  const readyToSend = Boolean(sendAfter && now >= sendAfter);
-
-  if (!readyToSend && !options.force) {
+  if (expectedSlot && expectedSlot !== dayType && !options.force) {
     return {
       ok: true,
       module: "body",
-      kind: "morning-wake",
+      kind: "morning-calendar",
       date: reportDate,
+      dayType,
       sent: [],
       skipped: [{
-        reason: wakeTime ? "waiting-after-wake" : "wake-time-not-ready",
-        bedtimeEnd: wakeWellness.bedtimeEnd || null,
-        sendAfter: sendAfter ? sendAfter.toISOString() : null,
+        reason: "not-scheduled-for-day-type",
+        expected: expectedSlot,
+        actual: dayType,
         now: now.toISOString()
       }],
       previews: [],
@@ -171,10 +186,10 @@ async function runMorningWakeReport(env, options = {}) {
 
   return {
     ...result,
-    kind: "morning-wake",
-    wakeDecision: {
-      bedtimeEnd: wakeWellness.bedtimeEnd || null,
-      sendAfter: sendAfter ? sendAfter.toISOString() : null,
+    kind: "morning-calendar",
+    calendarDecision: {
+      dayType,
+      expected: expectedSlot,
       now: now.toISOString(),
       forced: Boolean(options.force)
     }
@@ -1098,7 +1113,9 @@ function bodyOptions(url) {
     force: boolParam(url, "force"),
     dryRun: boolParam(url, "dry"),
     date: dateParam(url, "date"),
-    now: url.searchParams.get("now")
+    now: url.searchParams.get("now"),
+    slot: slotParam(url, "slot"),
+    expected: slotParam(url, "expected")
   };
 }
 
@@ -1155,10 +1172,22 @@ function dateParam(url, name) {
   return /^\d{4}-\d{2}-\d{2}$/.test(value || "") ? value : null;
 }
 
+function slotParam(url, name) {
+  const value = String(url.searchParams.get(name) || "").toLowerCase();
+  return ["workday", "restday"].includes(value) ? value : null;
+}
+
 function parseDateTime(value) {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function chinaDayType(date) {
+  if (CHINA_2026_WORKDAYS.has(date)) return "workday";
+  if (CHINA_2026_HOLIDAYS.has(date)) return "restday";
+  const day = new Date(`${date}T00:00:00Z`).getUTCDay();
+  return day === 0 || day === 6 ? "restday" : "workday";
 }
 
 function powerPeaks(activity) {

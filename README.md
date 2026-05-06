@@ -6,7 +6,7 @@
 2. Worker 定时读取 Intervals.icu 的 activities 与 wellness 数据。
 3. 如果配置了 Oura API token，Worker 会直接读取 Oura 官方恢复/睡眠/活动数据，并优先用于身体状态分析。
 4. 生成骑行分析、晨间身体状态、晚间身体小报。
-4. 通过 Resend 发到你的邮箱。
+5. 通过 Resend 发到你的邮箱。
 
 详细身体状态需求见 [docs/body-status-analysis.md](docs/body-status-analysis.md)。
 
@@ -15,7 +15,7 @@
 | 模块 | 触发时间 | 说明 |
 |---|---:|---|
 | 骑行分析 | 每 30 分钟 | 检查新骑行，发现未发送活动后生成 AI/规则分析邮件 |
-| 晨间身体状态 | 北京时间 08:00-10:00 | 起床后约 15 分钟发送；10:00 兜底 |
+| 晨间身体状态 | 工作日 09:20 / 休息日 10:00 | 按中国节假日与调休判断工作日/休息日 |
 | 晚间身体小报 | 北京时间 23:00 | 汇总当天活动/运动负荷、压力和睡前/次日建议 |
 
 ## 你需要准备
@@ -68,10 +68,10 @@ node scripts\local-run.mjs '/run/ride?dry=1&force=1&max=1'
 node scripts\local-run.mjs '/run/body/morning?dry=1&force=1&date=2026-05-02'
 ```
 
-晨间醒来检测 dry-run：
+晨间工作日历 dry-run：
 
 ```powershell
-node scripts\local-run.mjs '/run/body/morning/wake?dry=1&date=2026-05-02&now=2026-05-02T09:30:00%2B08:00'
+node scripts\local-run.mjs '/run/body/morning/calendar?dry=1&date=2026-05-06&slot=workday'
 ```
 
 晚间身体小报 dry-run：
@@ -88,6 +88,7 @@ node scripts\local-run.mjs '/run/body/evening?dry=1&force=1&date=2026-05-02'
 https://garmin-intervals-mailer.tanjiachen1127.workers.dev/health
 https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/ride?dry=1&force=1&max=1
 https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/body/morning?dry=1&force=1
+https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/body/morning/calendar?dry=1&date=2026-05-06&slot=workday
 https://garmin-intervals-mailer.tanjiachen1127.workers.dev/run/body/evening?dry=1&force=1
 ```
 
@@ -122,7 +123,7 @@ npm.cmd run deploy
 
 ```text
 */30 * * * *   骑行分析
-*/15 0-1 * * * 北京时间 08:00-09:45 晨报醒来检测
-0 2 * * *      北京时间 10:00 晨报兜底
+20 1 * * *     北京时间 09:20 工作日晨报
+0 2 * * *      北京时间 10:00 休息日晨报
 0 15 * * *     北京时间 23:00 晚报
 ```
